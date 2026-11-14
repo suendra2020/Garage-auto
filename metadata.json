@@ -1,0 +1,8 @@
+{
+  "name": "GARAGE-CONNECT-APP",
+  "description": "Multi-tenant SaaS dashboard for automobile garages to import job card Excel files, identify delivered vehicles, and manage WhatsApp delivery & Google Review outreach.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
