@@ -66,6 +66,7 @@ export interface GarageTenant {
   branding: GarageBranding;
   whatsappSettings: GarageWhatsAppSettings;
   reviewSocialLinks: ReviewSocialLinks;
+  savedImportMapping?: ExcelColumnMapping | null;
 }
 
 export interface TenantUser {
@@ -119,6 +120,9 @@ export interface JobCard {
   rawStatus: string;
   isDelivered: boolean;
   deliveredAt: string | null;
+  serviceAdvisor?: string;
+  invoiceNumber?: string;
+  amount?: number | null;
   importedAt?: string;
   createdAt?: string;
   whatsappDispatchStatus: 'not_sent' | 'draft_prepared';
@@ -128,9 +132,12 @@ export interface ImportBatch {
   id: string;
   tenantId: string;
   fileName: string;
+  sheetName?: string;
   importedAt: string;
   totalRows: number;
   importedCount?: number;
+  updatedCount?: number;
+  duplicateCount?: number;
   deliveredCount: number;
   skippedCount: number;
   failedCount: number;
@@ -209,6 +216,52 @@ export interface ExcelColumnMapping {
   vehicleModel: string;
   serviceType: string;
   rawStatus: string;
+  deliveryDate?: string;
+  serviceAdvisor?: string;
+  invoiceNumber?: string;
+  amount?: string;
+}
+
+export type ImportRowDisposition =
+  | 'new'
+  | 'update'
+  | 'duplicate_in_file'
+  | 'invalid'
+  | 'skipped_empty';
+
+export interface ValidatedImportRow {
+  rowNumber: number;
+  disposition: ImportRowDisposition;
+  jobCardNumber: string;
+  customerName: string;
+  phoneNumber: string;
+  vehicleRegistration: string;
+  rawStatus: string;
+  parsedDeliveryDate: string | null;
+  errors: string[];
+  warnings: string[];
+  card: JobCard | null;
+}
+
+export interface ImportErrorReportRow {
+  rowNumber: number;
+  jobCardNumber: string;
+  customerName: string;
+  vehicleRegistration: string;
+  issueType: 'invalid' | 'duplicate_in_file' | 'skipped_empty' | 'warning';
+  reason: string;
+}
+
+export interface ImportAnalysisSummary {
+  totalScanned: number;
+  validNewCount: number;
+  updatedExistingCount: number;
+  duplicateInFileCount: number;
+  invalidCount: number;
+  skippedEmptyCount: number;
+  deliveredConfirmedCount: number;
+  preservedDeliveryCount: number;
+  deliveryDateMissingCount: number;
 }
 
 export interface SystemSettingsState {

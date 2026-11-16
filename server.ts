@@ -23,6 +23,14 @@ const supabaseUrl = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL |
 const supabaseAnonKey = (process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '').trim();
 const supabaseServiceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 
+function hasValidServiceRoleKey(key: string): boolean {
+  const clean = key.replace(/^["']|["']$/g, '').trim();
+  if (!clean) return false;
+  if (clean.includes('YOUR_SUPABASE_SERVICE_ROLE_KEY')) return false;
+  if (clean.startsWith('sb_publishable_')) return false;
+  return true;
+}
+
 async function startServer() {
   const app = express();
   const httpServer = http.createServer(app);
@@ -34,83 +42,10 @@ async function startServer() {
       supabaseConfigured: Boolean(supabaseUrl && supabaseAnonKey && !supabaseUrl.includes('YOUR_PROJECT_REF')),
       staffProvisioningAvailable: Boolean(
         supabaseUrl &&
-          supabaseServiceRoleKey &&
           !supabaseUrl.includes('YOUR_PROJECT_REF') &&
-          !supabaseServiceRoleKey.includes('YOUR_SUPABASE_SERVICE_ROLE_KEY'),
+          hasValidServiceRoleKey(supabaseServiceRoleKey),
       ),
     });
-  });
-
-  app.post('/api/_tmp_provision_admin', async (req, res) => {
-    const { email, password, fullName } = req.body as {
-      email?: string;
-      password?: string;
-      fullName?: string;
-    };
-    if (!email || !password) {
-      res.status(400).json({ error: 'email and password required' });
-      return;
-    }
-    try {
-      const adminClient = createClient(supabaseUrl, supabaseServiceRoleKey, {
-        auth: { persistSession: false, autoRefreshToken: false },
-      });
-      const cleanEmail = email.trim().toLowerCase();
-      const { data: listData, error: listErr } = await adminClient.auth.admin.listUsers({
-        page: 1,
-        perPage: 200,
-      });
-      if (listErr) {
-        res.status(500).json({ step: 'listUsers', error: listErr.message });
-        return;
-      }
-      let user = listData.users.find((u) => u.email?.toLowerCase() === cleanEmail);
-      if (!user) {
-        const { data: created, error: createErr } = await adminClient.auth.admin.createUser({
-          email: cleanEmail,
-          password,
-          email_confirm: true,
-          user_metadata: { full_name: fullName || 'Platform Super Admin' },
-          app_metadata: { role: 'super_admin' },
-        });
-        if (createErr || !created.user) {
-          res.status(400).json({ step: 'createUser', error: createErr?.message });
-          return;
-        }
-        user = created.user;
-      } else {
-        const { data: updated, error: updErr } = await adminClient.auth.admin.updateUserById(
-          user.id,
-          {
-            password,
-            email_confirm: true,
-            user_metadata: { ...(user.user_metadata ?? {}), full_name: fullName || 'Platform Super Admin' },
-            app_metadata: { ...(user.app_metadata ?? {}), role: 'super_admin' },
-          },
-        );
-        if (updErr || !updated.user) {
-          res.status(400).json({ step: 'updateUserById', error: updErr?.message });
-          return;
-        }
-        user = updated.user;
-      }
-
-      const { error: profErr } = await adminClient.from('profiles').upsert({
-        id: user.id,
-        full_name: fullName || 'Platform Super Admin',
-        email: cleanEmail,
-        role: 'super_admin',
-      });
-
-      res.json({
-        ok: true,
-        userId: user.id,
-        email: user.email,
-        profileTableStatus: profErr ? `profile_error: ${profErr.message}` : 'profile_ok',
-      });
-    } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-    }
   });
 
   // Server-side staff account creation strictly verifying caller JWT and garage_admin membership
@@ -118,13 +53,12 @@ async function startServer() {
     if (
       !supabaseUrl ||
       !supabaseAnonKey ||
-      !supabaseServiceRoleKey ||
       supabaseUrl.includes('YOUR_PROJECT_REF') ||
-      supabaseServiceRoleKey.includes('YOUR_SUPABASE_SERVICE_ROLE_KEY')
+      !hasValidServiceRoleKey(supabaseServiceRoleKey)
     ) {
       res.status(503).json({
         error:
-          'Server staff provisioning requires SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_SERVICE_ROLE_KEY.',
+          'Server staff provisioning requires SUPABASE_URL, SUPABASE_ANON_KEY, and a secret SUPABASE_SERVICE_ROLE_KEY.',
       });
       return;
     }

@@ -62,17 +62,22 @@ export function buildSampleJobCardCsv(): string {
   const headers = [
     'Job Card No',
     'Customer Name',
-    'WhatsApp Phone',
-    'Vehicle Reg',
+    'Mobile No',
+    'Vehicle Reg No',
+    'Vehicle Brand',
     'Vehicle Model',
-    'Service Type',
-    'Status',
+    'Service Details',
+    'Job Card Status',
+    'Delivery Date',
+    'Service Advisor',
+    'Invoice No',
+    'Amount',
   ];
   const rows = [
-    ['JC-1042', 'Arjun Mehta', '+919820112233', 'MH02DN4512', 'Hyundai Creta SX', 'Periodic Maintenance', 'Delivered'],
-    ['JC-1043', 'Kavita Krishnan', '+919845098765', 'KA05MJ8821', 'Honda City ZX', 'AC & Brake Service', 'Delivered'],
-    ['JC-1044', 'Sameer Joshi', '+919765432109', 'MH14GT3310', 'Tata Harrier', 'Bodywork & Paint', 'In Progress'],
-    ['JC-1045', 'Neha Kulkarni', '+919811445566', 'DL08CA7741', 'Maruti Baleno', 'Wheel Alignment', 'Ready for Delivery'],
+    ['JC-1042', 'Arjun Mehta', '+919820112233', 'MH02DN4512', 'Hyundai', 'Creta SX', 'Periodic Maintenance', 'Delivered', '2026-11-15', 'Vikram Rao', 'INV-2042', '8450'],
+    ['JC-1043', 'Kavita Krishnan', '+919845098765', 'KA05MJ8821', 'Honda', 'City ZX', 'AC & Brake Service', 'Delivered', '2026-11-14', 'Anita Nair', 'INV-2043', '6200'],
+    ['JC-1044', 'Sameer Joshi', '+919765432109', 'MH14GT3310', 'Tata', 'Harrier', 'Bodywork & Paint', 'In Progress', '', 'Vikram Rao', '', ''],
+    ['JC-1045', 'Neha Kulkarni', '+919811445566', 'DL08CA7741', 'Maruti', 'Baleno', 'Wheel Alignment', 'Ready for Delivery', '', 'Rohan Deshmukh', 'INV-2045', '2150'],
   ];
   return [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
 }

@@ -5,11 +5,13 @@ import {
   createStaffAccountSupabase,
   createSupabaseGarageWorkspace,
   fetchSupabaseGarageScopedData,
+  fetchSupabaseSuperAdminData,
   insertSupabaseImportAndJobCards,
   insertSupabaseWhatsAppLogDraft,
   loadSupabaseAuthenticatedContext,
   registerGarageOwnerSupabase,
   resendVerificationEmailSupabase,
+  saveSupabaseGarageImportMapping,
   sendPasswordResetEmailSupabase,
   signInSupabasePassword,
   signOutSupabase,
@@ -17,9 +19,11 @@ import {
   updateProfileNameSupabase,
   updateSupabaseGarageFields,
   updateSupabaseJobCardStatus,
+  writeLocalGarageImportMapping,
 } from '../services/supabaseGarageService';
 import type {
   AuthScreenView,
+  ExcelColumnMapping,
   GarageBranding,
   GaragePage,
   GarageRegistrationInput,
@@ -185,7 +189,15 @@ interface AppStateContextValue {
     tenantId: string | null;
   }) => void;
 
-  importJobCardsForActiveTenant: (batch: ImportBatch, cards: JobCard[]) => Promise<void>;
+  importJobCardsForActiveTenant: (
+    batch: ImportBatch,
+    cards: JobCard[],
+    onBatchProgress?: (completedBatches: number, totalBatches: number) => void,
+  ) => Promise<void>;
+  saveGarageImportMapping: (
+    tenantId: string,
+    mapping: ExcelColumnMapping | null,
+  ) => Promise<void>;
   markJobCardDelivered: (jobCardId: string, isDelivered: boolean) => void;
   prepareWhatsAppDraftForCard: (jobCardId: string, templateId: string) => WhatsAppMessageLog | null;
 
@@ -289,11 +301,29 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
         setState((prev) => ({ ...prev, session: null }));
         return;
       }
+
+      if (ctx.session.role === 'super_admin') {
+        const adminData = await fetchSupabaseSuperAdminData();
+        setAuthError('');
+        setState((prev) => ({
+          ...prev,
+          session: ctx.session,
+          tenants: adminData.tenants,
+          jobCards: [],
+          importBatches: [],
+          templates: [],
+          whatsappLogs: [],
+          users: adminData.users,
+        }));
+        return;
+      }
+
       const activeId = ctx.session.tenantId;
       const scoped = activeId
         ? await fetchSupabaseGarageScopedData(activeId)
         : { jobCards: [], importBatches: [], templates: [], whatsappLogs: [], users: [] };
 
+      setAuthError('');
       setState((prev) => ({
         ...prev,
         session: ctx.session,
@@ -1012,19 +1042,66 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     }));
   };
 
-  const importJobCardsForActiveTenant = async (batch: ImportBatch, cards: JobCard[]) => {
-    if (!activeTenantId || !canUserAccessTenant(state.session, activeTenantId)) return;
-    if (batch.tenantId !== activeTenantId) return;
-    const strictlyScopedCards = cards.filter((c) => c.tenantId === activeTenantId);
+  const importJobCardsForActiveTenant = async (
+    batch: ImportBatch,
+    cards: JobCard[],
+    onBatchProgress?: (completedBatches: number, totalBatches: number) => void,
+  ) => {
+    const targetTenantId = batch.tenantId;
+    if (!targetTenantId || !canUserAccessTenant(state.session, targetTenantId)) {
+      throw new Error('You are not authorized to import job cards into this garage.');
+    }
+    const strictlyScopedCards = cards.filter((c) => c.tenantId === targetTenantId);
 
     if (supabaseConfigured && state.session?.authMode === 'supabase') {
-      await insertSupabaseImportAndJobCards(activeTenantId, batch, strictlyScopedCards);
+      await insertSupabaseImportAndJobCards(
+        targetTenantId,
+        batch,
+        strictlyScopedCards,
+        onBatchProgress,
+      );
+    } else if (strictlyScopedCards.length > 0) {
+      const totalChunks = Math.max(1, Math.ceil(strictlyScopedCards.length / 200));
+      for (let i = 1; i <= totalChunks; i += 1) {
+        onBatchProgress?.(i, totalChunks);
+      }
     }
 
+    setState((prev) => {
+      const incomingByKey = new Map<string, JobCard>();
+      strictlyScopedCards.forEach((c) => {
+        incomingByKey.set(`${c.tenantId}::${c.jobCardNumber.trim().toUpperCase()}`, c);
+      });
+
+      const preservedExisting = prev.jobCards.filter(
+        (c) => !incomingByKey.has(`${c.tenantId}::${c.jobCardNumber.trim().toUpperCase()}`),
+      );
+
+      return {
+        ...prev,
+        importBatches: [batch, ...prev.importBatches],
+        jobCards: [...strictlyScopedCards, ...preservedExisting],
+      };
+    });
+  };
+
+  const saveGarageImportMapping = async (
+    tenantId: string,
+    mapping: ExcelColumnMapping | null,
+  ) => {
+    if (!tenantId || !canUserAccessTenant(state.session, tenantId)) {
+      throw new Error('Unauthorized garage mapping update.');
+    }
+    if (supabaseConfigured && state.session?.authMode === 'supabase') {
+      await saveSupabaseGarageImportMapping(tenantId, mapping);
+    } else {
+      writeLocalGarageImportMapping(tenantId, mapping);
+    }
     setState((prev) => ({
       ...prev,
-      importBatches: [batch, ...prev.importBatches],
-      jobCards: [...strictlyScopedCards, ...prev.jobCards],
+      tenants: prev.tenants.map((t) =>
+        t.id === tenantId ? { ...t, savedImportMapping: mapping } : t,
+      ),
     }));
   };
 
@@ -1277,6 +1354,7 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
         updateTenantStatus,
         invitePlatformOrGarageUser,
         importJobCardsForActiveTenant,
+        saveGarageImportMapping,
         markJobCardDelivered,
         prepareWhatsAppDraftForCard,
         saveTemplateForActiveTenant,

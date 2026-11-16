@@ -1,5 +1,6 @@
 import { getSupabaseClient } from '../lib/supabase';
 import type {
+  ExcelColumnMapping,
   GarageRegistrationInput,
   GarageStatus,
   GarageTenant,
@@ -13,6 +14,7 @@ import type {
   UserSession,
   WhatsAppMessageLog,
 } from '../types/garage';
+import { chunkArray } from '../utils/excelImportEngine';
 import { generateSlug, isDeliveredStatus } from '../utils/tenantLogic';
 
 interface DbGarageRow {
@@ -29,6 +31,36 @@ interface DbGarageRow {
   subscription_plan: string;
   account_status: GarageStatus;
   created_at: string;
+  saved_import_mapping?: ExcelColumnMapping | null;
+}
+
+const LOCAL_MAPPING_PREFIX = 'gc_import_mapping_';
+
+export function readLocalGarageImportMapping(garageId: string): ExcelColumnMapping | null {
+  if (typeof window === 'undefined' || !garageId) return null;
+  try {
+    const raw = localStorage.getItem(`${LOCAL_MAPPING_PREFIX}${garageId}`);
+    if (!raw) return null;
+    return JSON.parse(raw) as ExcelColumnMapping;
+  } catch {
+    return null;
+  }
+}
+
+export function writeLocalGarageImportMapping(
+  garageId: string,
+  mapping: ExcelColumnMapping | null,
+): void {
+  if (typeof window === 'undefined' || !garageId) return;
+  try {
+    if (!mapping) {
+      localStorage.removeItem(`${LOCAL_MAPPING_PREFIX}${garageId}`);
+    } else {
+      localStorage.setItem(`${LOCAL_MAPPING_PREFIX}${garageId}`, JSON.stringify(mapping));
+    }
+  } catch {
+    // ignore storage errors
+  }
 }
 
 function mapDbGarageToTenant(row: DbGarageRow): GarageTenant {
@@ -39,6 +71,7 @@ function mapDbGarageToTenant(row: DbGarageRow): GarageTenant {
     planId: row.subscription_plan || 'plan_starter',
     status: row.account_status,
     createdAt: row.created_at,
+    savedImportMapping: row.saved_import_mapping ?? readLocalGarageImportMapping(row.id),
     branding: {
       displayName: row.garage_name,
       tagline: 'Authorized Vehicle Service & Care',
@@ -233,20 +266,40 @@ export async function loadSupabaseAuthenticatedContext(): Promise<{
     .select('id, full_name, email, role')
     .eq('id', authUser.id)
     .single();
-  if (profErr || !profile) return null;
 
-  const authorizedTenants: GarageTenant[] = [];
+  if (profErr || !profile) {
+    const msg = profErr?.message || '';
+    if (msg.includes('schema cache') || msg.includes('does not exist')) {
+      throw new Error(
+        'Supabase database tables are not created yet. Run SQL migrations 0001, 0002, and 0003 in your Supabase SQL Editor.',
+      );
+    }
+    throw new Error(msg || 'Authenticated user profile record not found in public.profiles.');
+  }
+
   let effectiveRole: PlatformRole = profile.role as PlatformRole;
+  let authorizedTenants: GarageTenant[] = [];
 
-  (memberships ?? []).forEach((m: Record<string, unknown>) => {
-    const g = m.garages as DbGarageRow | null;
-    if (g) {
-      authorizedTenants.push(mapDbGarageToTenant(g));
+  if (effectiveRole === 'super_admin') {
+    const { data: allGarages, error: garErr } = await client
+      .from('garages')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (garErr) {
+      throw new Error(garErr.message);
     }
-    if (effectiveRole !== 'super_admin' && m.role === 'garage_admin') {
-      effectiveRole = 'garage_admin';
-    }
-  });
+    authorizedTenants = (allGarages ?? []).map((g) => mapDbGarageToTenant(g as DbGarageRow));
+  } else {
+    (memberships ?? []).forEach((m: Record<string, unknown>) => {
+      const g = m.garages as DbGarageRow | null;
+      if (g) {
+        authorizedTenants.push(mapDbGarageToTenant(g));
+      }
+      if (m.role === 'garage_admin') {
+        effectiveRole = 'garage_admin';
+      }
+    });
+  }
 
   const authorizedTenantIds = authorizedTenants.map((t) => t.id);
 
@@ -263,6 +316,59 @@ export async function loadSupabaseAuthenticatedContext(): Promise<{
     },
     authorizedTenants,
   };
+}
+
+export async function fetchSupabaseSuperAdminData(): Promise<{
+  tenants: GarageTenant[];
+  users: TenantUser[];
+}> {
+  const client = getSupabaseClient();
+  if (!client) {
+    return { tenants: [], users: [] };
+  }
+
+  const [garagesRes, profilesRes, membershipsRes] = await Promise.all([
+    client.from('garages').select('*').order('created_at', { ascending: false }),
+    client
+      .from('profiles')
+      .select('id, full_name, email, role, created_at')
+      .order('created_at', { ascending: false }),
+    client.from('garage_users').select('garage_id, user_id, role'),
+  ]);
+
+  const queryErr = garagesRes.error || profilesRes.error;
+  if (queryErr) {
+    throw new Error(queryErr.message);
+  }
+
+  const membershipByUser = new Map<string, { garageId: string; role: PlatformRole }>();
+  (membershipsRes.data ?? []).forEach((m: Record<string, unknown>) => {
+    const uid = m.user_id as string;
+    if (!membershipByUser.has(uid)) {
+      membershipByUser.set(uid, {
+        garageId: m.garage_id as string,
+        role: m.role as PlatformRole,
+      });
+    }
+  });
+
+  const tenants = (garagesRes.data ?? []).map((g) => mapDbGarageToTenant(g as DbGarageRow));
+  const users: TenantUser[] = (profilesRes.data ?? []).map((p: Record<string, unknown>) => {
+    const uid = p.id as string;
+    const mem = membershipByUser.get(uid);
+    const profileRole = p.role as PlatformRole;
+    return {
+      id: uid,
+      tenantId: profileRole === 'super_admin' ? null : mem?.garageId ?? null,
+      fullName: (p.full_name as string) || (p.email as string) || 'User',
+      email: (p.email as string) || '',
+      role: profileRole === 'super_admin' ? 'super_admin' : mem?.role ?? profileRole,
+      status: 'active',
+      createdAt: (p.created_at as string) || new Date().toISOString(),
+    };
+  });
+
+  return { tenants, users };
 }
 
 export async function createSupabaseGarageWorkspace(input: {
@@ -407,8 +513,15 @@ export async function fetchSupabaseGarageScopedData(garageId: string): Promise<{
     vehicleModel: r.vehicle_model ?? '',
     serviceType: r.service_details ?? '',
     rawStatus: r.job_card_status,
-    isDelivered: isDeliveredStatus(r.job_card_status),
+    isDelivered: isDeliveredStatus(r.job_card_status) && Boolean(r.delivery_date),
     deliveredAt: r.delivery_date,
+    serviceAdvisor: (r as Record<string, unknown>).service_advisor as string | undefined,
+    invoiceNumber: (r as Record<string, unknown>).invoice_number as string | undefined,
+    amount:
+      (r as Record<string, unknown>).amount !== null &&
+      (r as Record<string, unknown>).amount !== undefined
+        ? Number((r as Record<string, unknown>).amount)
+        : null,
     importedAt: r.imported_at ?? r.created_at,
     createdAt: r.created_at,
     whatsappDispatchStatus: 'not_sent',
@@ -421,6 +534,8 @@ export async function fetchSupabaseGarageScopedData(garageId: string): Promise<{
     importedAt: r.created_at,
     totalRows: r.total_records,
     importedCount: r.imported_records,
+    updatedCount: (r as Record<string, unknown>).updated_records as number | undefined,
+    duplicateCount: (r as Record<string, unknown>).duplicate_records as number | undefined,
     deliveredCount: 0,
     skippedCount: r.skipped_records,
     failedCount: r.failed_records,
@@ -529,41 +644,107 @@ export async function insertSupabaseWhatsAppLogDraft(
   if (error) throw error;
 }
 
+export async function saveSupabaseGarageImportMapping(
+  garageId: string,
+  mapping: ExcelColumnMapping | null,
+) {
+  writeLocalGarageImportMapping(garageId, mapping);
+  const client = getSupabaseClient();
+  if (!client) return;
+  const { error } = await client
+    .from('garages')
+    .update({ saved_import_mapping: mapping })
+    .eq('id', garageId);
+  if (error && !error.message.includes('saved_import_mapping')) {
+    throw error;
+  }
+}
+
 export async function insertSupabaseImportAndJobCards(
   garageId: string,
   batch: ImportBatch,
   cards: JobCard[],
+  onBatchProgress?: (completedBatches: number, totalBatches: number) => void,
 ) {
   const client = getSupabaseClient();
   if (!client) return;
 
-  const { error: impErr } = await client.from('excel_imports').insert({
+  const fullBatchPayload = {
     garage_id: garageId,
     file_name: batch.fileName,
-    total_records: batch.totalRows + batch.skippedCount,
-    imported_records: cards.length,
+    total_records: batch.totalRows,
+    imported_records: batch.importedCount ?? cards.length,
+    updated_records: batch.updatedCount ?? 0,
+    duplicate_records: batch.duplicateCount ?? 0,
     skipped_records: batch.skippedCount,
     failed_records: batch.failedCount,
-  });
+  };
+
+  let { error: impErr } = await client.from('excel_imports').insert(fullBatchPayload);
+  if (impErr && (impErr.message.includes('updated_records') || impErr.message.includes('duplicate_records'))) {
+    const fallbackRes = await client.from('excel_imports').insert({
+      garage_id: garageId,
+      file_name: batch.fileName,
+      total_records: batch.totalRows,
+      imported_records: cards.length,
+      skipped_records: batch.skippedCount,
+      failed_records: batch.failedCount,
+    });
+    impErr = fallbackRes.error;
+  }
   if (impErr) throw impErr;
 
   if (cards.length > 0) {
-    const payload = cards.map((c) => ({
-      garage_id: garageId,
-      job_card_number: c.jobCardNumber,
-      customer_name: c.customerName,
-      mobile_number: c.phoneNumber || null,
-      vehicle_number: c.vehicleRegistration,
-      vehicle_brand: c.vehicleBrand || null,
-      vehicle_model: c.vehicleModel || null,
-      service_details: c.serviceType || null,
-      job_card_status: c.rawStatus,
-      delivery_date: c.deliveredAt,
-    }));
-    const { error: cardsErr } = await client
-      .from('job_cards')
-      .upsert(payload, { onConflict: 'garage_id,job_card_number' });
-    if (cardsErr) throw cardsErr;
+    const chunks = chunkArray(cards, 200);
+    for (let i = 0; i < chunks.length; i += 1) {
+      const chunk = chunks[i];
+      const extendedPayload = chunk.map((c) => ({
+        garage_id: garageId,
+        job_card_number: c.jobCardNumber,
+        customer_name: c.customerName,
+        mobile_number: c.phoneNumber || null,
+        vehicle_number: c.vehicleRegistration,
+        vehicle_brand: c.vehicleBrand || null,
+        vehicle_model: c.vehicleModel || null,
+        service_details: c.serviceType || null,
+        job_card_status: c.rawStatus,
+        delivery_date: c.deliveredAt,
+        service_advisor: c.serviceAdvisor || null,
+        invoice_number: c.invoiceNumber || null,
+        amount: c.amount ?? null,
+      }));
+
+      let { error: cardsErr } = await client
+        .from('job_cards')
+        .upsert(extendedPayload, { onConflict: 'garage_id,job_card_number' });
+
+      if (
+        cardsErr &&
+        (cardsErr.message.includes('service_advisor') ||
+          cardsErr.message.includes('invoice_number') ||
+          cardsErr.message.includes('amount'))
+      ) {
+        const corePayload = chunk.map((c) => ({
+          garage_id: garageId,
+          job_card_number: c.jobCardNumber,
+          customer_name: c.customerName,
+          mobile_number: c.phoneNumber || null,
+          vehicle_number: c.vehicleRegistration,
+          vehicle_brand: c.vehicleBrand || null,
+          vehicle_model: c.vehicleModel || null,
+          service_details: c.serviceType || null,
+          job_card_status: c.rawStatus,
+          delivery_date: c.deliveredAt,
+        }));
+        const fallbackUpsert = await client
+          .from('job_cards')
+          .upsert(corePayload, { onConflict: 'garage_id,job_card_number' });
+        cardsErr = fallbackUpsert.error;
+      }
+
+      if (cardsErr) throw cardsErr;
+      onBatchProgress?.(i + 1, chunks.length);
+    }
   }
 }
 
