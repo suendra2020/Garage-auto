@@ -7,7 +7,7 @@ import {
   fetchSupabaseGarageScopedData,
   fetchSupabaseSuperAdminData,
   insertSupabaseImportAndJobCards,
-  insertSupabaseWhatsAppLogDraft,
+  insertSupabaseWhatsAppLogDrafts,
   loadSupabaseAuthenticatedContext,
   registerGarageOwnerSupabase,
   resendVerificationEmailSupabase,
@@ -18,8 +18,9 @@ import {
   updatePasswordSupabase,
   updateProfileNameSupabase,
   updateSupabaseGarageFields,
-  updateSupabaseJobCardStatus,
+  updateSupabaseJobCardDelivery,
   writeLocalGarageImportMapping,
+  writeLocalPublicGarageCache,
 } from '../services/supabaseGarageService';
 import type {
   AuthScreenView,
@@ -44,6 +45,15 @@ import type {
   UserSession,
   WhatsAppMessageLog,
 } from '../types/garage';
+import {
+  buildPublicGarageProfile,
+  normalizeGarageSlug,
+} from '../utils/garageConnection';
+import {
+  buildConfirmedDeliveryUpdate,
+  evaluateCustomerOutreachEligibility,
+  isAuthorizedDeliveryConfirmer,
+} from '../utils/jobCardDelivery';
 import {
   canAssignRole,
   canManageGarageStaff,
@@ -198,8 +208,17 @@ interface AppStateContextValue {
     tenantId: string,
     mapping: ExcelColumnMapping | null,
   ) => Promise<void>;
-  markJobCardDelivered: (jobCardId: string, isDelivered: boolean) => void;
+  confirmJobCardDelivery: (input: {
+    jobCardId: string;
+    deliveryDateIso: string;
+    handoverConfirmed: boolean;
+  }) => Promise<JobCard>;
+  revertJobCardDelivery: (jobCardId: string) => Promise<void>;
   prepareWhatsAppDraftForCard: (jobCardId: string, templateId: string) => WhatsAppMessageLog | null;
+  prepareWhatsAppDraftsForCards: (
+    jobCardIds: readonly string[],
+    templateId: string,
+  ) => WhatsAppMessageLog[];
 
   saveTemplateForActiveTenant: (input: {
     id?: string;
@@ -209,9 +228,9 @@ interface AppStateContextValue {
   }) => void;
   deleteTemplateForActiveTenant: (templateId: string) => void;
 
-  updateActiveBranding: (branding: GarageBranding) => void;
-  updateActiveWhatsAppSettings: (settings: GarageWhatsAppSettings) => void;
-  updateActiveReviewLinks: (links: ReviewSocialLinks) => void;
+  updateActiveBranding: (branding: GarageBranding, nextSlug?: string) => Promise<void>;
+  updateActiveWhatsAppSettings: (settings: GarageWhatsAppSettings) => Promise<void>;
+  updateActiveReviewLinks: (links: ReviewSocialLinks) => Promise<void>;
 
   updateSubscriptionPlan: (plan: SubscriptionPlan) => void;
   updateSystemSettings: (next: SystemSettingsState) => void;
@@ -1105,78 +1124,152 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     }));
   };
 
-  const markJobCardDelivered = (jobCardId: string, isDelivered: boolean) => {
-    if (!activeTenantId) return;
-    if (supabaseConfigured && state.session?.authMode === 'supabase') {
-      void updateSupabaseJobCardStatus(activeTenantId, jobCardId, isDelivered);
+  const confirmJobCardDelivery = async (input: {
+    jobCardId: string;
+    deliveryDateIso: string;
+    handoverConfirmed: boolean;
+  }): Promise<JobCard> => {
+    if (!activeTenantId || !state.session || !isAuthorizedDeliveryConfirmer(state.session, activeTenantId)) {
+      throw new Error('Only authorized garage staff can confirm vehicle delivery.');
+    }
+    if (!input.handoverConfirmed) {
+      throw new Error('Actual vehicle handover confirmation is required.');
+    }
+    const targetCard = state.jobCards.find(
+      (c) => c.id === input.jobCardId && c.tenantId === activeTenantId,
+    );
+    if (!targetCard) {
+      throw new Error('Job card not found in your active garage.');
+    }
+
+    const confirmationTimestampIso = new Date().toISOString();
+    const updatedCard = buildConfirmedDeliveryUpdate({
+      card: targetCard,
+      deliveryDateIso: input.deliveryDateIso,
+      confirmedByUserId: state.session.userId,
+      confirmationTimestampIso,
+    });
+
+    if (supabaseConfigured && state.session.authMode === 'supabase') {
+      await updateSupabaseJobCardDelivery({
+        garageId: activeTenantId,
+        jobCardId: targetCard.id,
+        isDelivered: true,
+        deliveredAt: updatedCard.deliveredAt,
+        deliveredBy: updatedCard.deliveredBy ?? state.session.userId,
+        deliveryConfirmedAt: updatedCard.deliveryConfirmedAt ?? confirmationTimestampIso,
+      });
+    }
+
+    setState((prev) => ({
+      ...prev,
+      jobCards: prev.jobCards.map((card) =>
+        card.id === targetCard.id && card.tenantId === activeTenantId ? updatedCard : card,
+      ),
+    }));
+
+    return updatedCard;
+  };
+
+  const revertJobCardDelivery = async (jobCardId: string) => {
+    if (!activeTenantId || !state.session || !isAuthorizedDeliveryConfirmer(state.session, activeTenantId)) {
+      throw new Error('Only authorized garage staff can modify delivery status.');
+    }
+    if (supabaseConfigured && state.session.authMode === 'supabase') {
+      await updateSupabaseJobCardDelivery({
+        garageId: activeTenantId,
+        jobCardId,
+        isDelivered: false,
+        deliveredAt: null,
+        deliveredBy: null,
+        deliveryConfirmedAt: null,
+      });
     }
     setState((prev) => ({
       ...prev,
-      jobCards: prev.jobCards.map((card) => {
-        if (card.id !== jobCardId || card.tenantId !== activeTenantId) {
-          return card;
-        }
-        return {
-          ...card,
-          isDelivered,
-          rawStatus: isDelivered ? 'Delivered' : 'In Progress',
-          deliveredAt: isDelivered ? new Date().toISOString() : null,
-        };
-      }),
+      jobCards: prev.jobCards.map((card) =>
+        card.id === jobCardId && card.tenantId === activeTenantId
+          ? {
+              ...card,
+              isDelivered: false,
+              rawStatus: 'In Progress',
+              deliveredAt: null,
+              deliveredBy: null,
+              deliveryConfirmedAt: null,
+            }
+          : card,
+      ),
     }));
+  };
+
+  const prepareWhatsAppDraftsForCards = (
+    jobCardIds: readonly string[],
+    templateId: string,
+  ): WhatsAppMessageLog[] => {
+    if (!activeTenant) return [];
+    const template = state.templates.find(
+      (t) => t.id === templateId && t.tenantId === activeTenant.id,
+    );
+    if (!template) return [];
+
+    const idSet = new Set(jobCardIds);
+    const eligibleCards = state.jobCards.filter((card) => {
+      if (!idSet.has(card.id) || card.tenantId !== activeTenant.id) return false;
+      return evaluateCustomerOutreachEligibility(card, state.whatsappLogs, activeTenant.id).eligible;
+    });
+
+    if (eligibleCards.length === 0) return [];
+
+    const now = new Date().toISOString();
+    const createdLogs: WhatsAppMessageLog[] = eligibleCards.map((card, idx) => {
+      const rendered = renderWhatsAppTemplate(template.body, {
+        customerName: card.customerName,
+        garageName: activeTenant.branding.displayName,
+        vehicleReg: card.vehicleRegistration,
+        vehicleModel: card.vehicleModel,
+        jobCardNumber: card.jobCardNumber,
+        googleReviewUrl: activeTenant.reviewSocialLinks.googleReviewUrl,
+        instagramUrl: activeTenant.reviewSocialLinks.instagramUrl,
+      });
+
+      return {
+        id: `wa_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 5)}`,
+        tenantId: activeTenant.id,
+        jobCardId: card.id,
+        customerName: card.customerName,
+        phoneNumber: card.phoneNumber,
+        vehicleRegistration: card.vehicleRegistration,
+        templateName: template.name,
+        renderedMessage: rendered,
+        status: 'draft_not_sent_api_disconnected',
+        createdAt: now,
+      };
+    });
+
+    if (supabaseConfigured && state.session?.authMode === 'supabase') {
+      void insertSupabaseWhatsAppLogDrafts(activeTenant.id, createdLogs);
+    }
+
+    const preparedCardIds = new Set(eligibleCards.map((c) => c.id));
+    setState((prev) => ({
+      ...prev,
+      whatsappLogs: [...createdLogs, ...prev.whatsappLogs],
+      jobCards: prev.jobCards.map((c) =>
+        preparedCardIds.has(c.id) && c.tenantId === activeTenant.id
+          ? { ...c, whatsappDispatchStatus: 'draft_prepared' }
+          : c,
+      ),
+    }));
+
+    return createdLogs;
   };
 
   const prepareWhatsAppDraftForCard = (
     jobCardId: string,
     templateId: string,
   ): WhatsAppMessageLog | null => {
-    if (!activeTenant) return null;
-    const card = state.jobCards.find(
-      (c) => c.id === jobCardId && c.tenantId === activeTenant.id,
-    );
-    const template = state.templates.find(
-      (t) => t.id === templateId && t.tenantId === activeTenant.id,
-    );
-    if (!card || !template) return null;
-
-    const rendered = renderWhatsAppTemplate(template.body, {
-      customerName: card.customerName,
-      garageName: activeTenant.branding.displayName,
-      vehicleReg: card.vehicleRegistration,
-      vehicleModel: card.vehicleModel,
-      jobCardNumber: card.jobCardNumber,
-      googleReviewUrl: activeTenant.reviewSocialLinks.googleReviewUrl,
-      instagramUrl: activeTenant.reviewSocialLinks.instagramUrl,
-    });
-
-    const logEntry: WhatsAppMessageLog = {
-      id: `wa_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
-      tenantId: activeTenant.id,
-      jobCardId: card.id,
-      customerName: card.customerName,
-      phoneNumber: card.phoneNumber || 'Missing Phone Number',
-      vehicleRegistration: card.vehicleRegistration,
-      templateName: template.name,
-      renderedMessage: rendered,
-      status: 'draft_not_sent_api_disconnected',
-      createdAt: new Date().toISOString(),
-    };
-
-    if (supabaseConfigured && state.session?.authMode === 'supabase') {
-      void insertSupabaseWhatsAppLogDraft(activeTenant.id, logEntry);
-    }
-
-    setState((prev) => ({
-      ...prev,
-      whatsappLogs: [logEntry, ...prev.whatsappLogs],
-      jobCards: prev.jobCards.map((c) =>
-        c.id === card.id && c.tenantId === activeTenant.id
-          ? { ...c, whatsappDispatchStatus: 'draft_prepared' }
-          : c,
-      ),
-    }));
-
-    return logEntry;
+    const created = prepareWhatsAppDraftsForCards([jobCardId], templateId);
+    return created[0] ?? null;
   };
 
   const saveTemplateForActiveTenant = (input: {
@@ -1231,32 +1324,52 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     }));
   };
 
-  const updateActiveBranding = (branding: GarageBranding) => {
-    if (!activeTenantId || !canManageGarageStaff(state.session, activeTenantId)) return;
+  const updateActiveBranding = async (branding: GarageBranding, nextSlug?: string) => {
+    if (!activeTenantId || !activeTenant || !canManageGarageStaff(state.session, activeTenantId)) {
+      throw new Error('Only an authorized Garage Admin can update garage settings.');
+    }
+    const previousSlug = activeTenant.slug;
+    const resolvedSlug =
+      normalizeGarageSlug(nextSlug ?? activeTenant.slug) || generateSlug(branding.displayName);
+
     if (supabaseConfigured && state.session?.authMode === 'supabase') {
-      void updateSupabaseGarageFields(activeTenantId, {
+      await updateSupabaseGarageFields(activeTenantId, {
         garage_name: branding.displayName,
+        slug: resolvedSlug,
         address: branding.city,
         phone_number: branding.contactPhone,
         email: branding.contactEmail,
         logo_url: branding.logoUrl,
+        customer_welcome_text: branding.customerWelcomeText ?? '',
       });
     }
+
+    const updatedTenant: GarageTenant = {
+      ...activeTenant,
+      name: branding.displayName,
+      slug: resolvedSlug,
+      branding,
+    };
+    if (updatedTenant.status === 'active') {
+      writeLocalPublicGarageCache(buildPublicGarageProfile(updatedTenant), previousSlug);
+    }
+
     setState((prev) => ({
       ...prev,
-      tenants: prev.tenants.map((t) =>
-        t.id === activeTenantId
-          ? { ...t, name: branding.displayName, branding }
-          : t,
-      ),
+      tenants: prev.tenants.map((t) => (t.id === activeTenantId ? updatedTenant : t)),
     }));
   };
 
-  const updateActiveWhatsAppSettings = (whatsappSettings: GarageWhatsAppSettings) => {
-    if (!activeTenantId || !canManageGarageStaff(state.session, activeTenantId)) return;
+  const updateActiveWhatsAppSettings = async (whatsappSettings: GarageWhatsAppSettings) => {
+    if (!activeTenantId || !activeTenant || !canManageGarageStaff(state.session, activeTenantId)) {
+      throw new Error('Only an authorized Garage Admin can update WhatsApp settings.');
+    }
     if (supabaseConfigured && state.session?.authMode === 'supabase') {
-      void updateSupabaseGarageFields(activeTenantId, {
+      await updateSupabaseGarageFields(activeTenantId, {
         whatsapp_phone_number_id: whatsappSettings.phoneNumberId,
+        whatsapp_waba_id: whatsappSettings.wabaId,
+        whatsapp_display_name: whatsappSettings.businessDisplayName,
+        whatsapp_default_message: whatsappSettings.defaultMessage ?? '',
       });
     }
     setState((prev) => ({
@@ -1267,20 +1380,27 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     }));
   };
 
-  const updateActiveReviewLinks = (reviewSocialLinks: ReviewSocialLinks) => {
-    if (!activeTenantId) return;
+  const updateActiveReviewLinks = async (reviewSocialLinks: ReviewSocialLinks) => {
+    if (!activeTenantId || !activeTenant || !canManageGarageStaff(state.session, activeTenantId)) {
+      throw new Error('Only an authorized Garage Admin can update review & social links.');
+    }
     if (supabaseConfigured && state.session?.authMode === 'supabase') {
-      void updateSupabaseGarageFields(activeTenantId, {
+      await updateSupabaseGarageFields(activeTenantId, {
         google_review_url: reviewSocialLinks.googleReviewUrl,
         instagram_url: reviewSocialLinks.instagramUrl,
         youtube_url: reviewSocialLinks.youtubeUrl,
       });
     }
+    const updatedTenant: GarageTenant = {
+      ...activeTenant,
+      reviewSocialLinks,
+    };
+    if (updatedTenant.status === 'active') {
+      writeLocalPublicGarageCache(buildPublicGarageProfile(updatedTenant));
+    }
     setState((prev) => ({
       ...prev,
-      tenants: prev.tenants.map((t) =>
-        t.id === activeTenantId ? { ...t, reviewSocialLinks } : t,
-      ),
+      tenants: prev.tenants.map((t) => (t.id === activeTenantId ? updatedTenant : t)),
     }));
   };
 
@@ -1355,8 +1475,10 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
         invitePlatformOrGarageUser,
         importJobCardsForActiveTenant,
         saveGarageImportMapping,
-        markJobCardDelivered,
+        confirmJobCardDelivery,
+        revertJobCardDelivery,
         prepareWhatsAppDraftForCard,
+        prepareWhatsAppDraftsForCards,
         saveTemplateForActiveTenant,
         deleteTemplateForActiveTenant,
         updateActiveBranding,

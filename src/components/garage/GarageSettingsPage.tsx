@@ -1,40 +1,134 @@
-import React, { useState } from 'react';
-import { AlertCircle, CheckCircle2, Lock, UserPlus } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  AlertCircle,
+  CheckCircle2,
+  Copy,
+  ExternalLink,
+  Eye,
+  Instagram,
+  Lock,
+  Star,
+  Trash2,
+  Upload,
+  UserPlus,
+  X,
+  Youtube,
+} from 'lucide-react';
 import { useAppState } from '../../context/AppStateContext';
+import type { PublicGarageConnectionProfile } from '../../types/garage';
+import {
+  DEFAULT_CUSTOMER_WELCOME_TEXT,
+  buildPublicGaragePath,
+  getInitials,
+  normalizeGarageSlug,
+  validateGarageProfileSettingsInput,
+  validateGarageSocialLinksInput,
+} from '../../utils/garageConnection';
 import {
   canManageGarageStaff,
   validateStaffCreationInput,
 } from '../../utils/tenantLogic';
+import { CustomerConnectionCard } from '../public/CustomerConnectionCard';
+
+async function fileToResizedDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Unable to read logo image file.'));
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : '';
+      if (!result) {
+        reject(new Error('Invalid image file.'));
+        return;
+      }
+      // Keep crisp SVG uploads directly if compact, otherwise draw onto a 256px max canvas
+      if (file.type === 'image/svg+xml' && result.length < 100_000) {
+        resolve(result);
+        return;
+      }
+      const img = new Image();
+      img.onerror = () => reject(new Error('Unsupported logo image format.'));
+      img.onload = () => {
+        const maxDim = 256;
+        const scale = Math.min(1, maxDim / Math.max(img.width || 1, img.height || 1));
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(result);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL('image/png', 0.9));
+      };
+      img.src = result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
 
 export function GarageSettingsPage() {
   const {
     session,
     activeTenant,
+    tenants,
     tenantUsers,
     updateActiveBranding,
+    updateActiveReviewLinks,
     updateActiveWhatsAppSettings,
     createGarageStaffAccount,
   } = useAppState();
 
-  const [displayName, setDisplayName] = useState(
-    activeTenant?.branding.displayName ?? '',
-  );
-  const [tagline, setTagline] = useState(activeTenant?.branding.tagline ?? '');
+  // Profile & Customer Connection Page fields
+  const [displayName, setDisplayName] = useState(activeTenant?.branding.displayName ?? '');
+  const [slug, setSlug] = useState(activeTenant?.slug ?? '');
+  const [logoUrl, setLogoUrl] = useState(activeTenant?.branding.logoUrl ?? '');
   const [city, setCity] = useState(activeTenant?.branding.city ?? '');
-  const [contactPhone, setContactPhone] = useState(
-    activeTenant?.branding.contactPhone ?? '',
+  const [contactPhone, setContactPhone] = useState(activeTenant?.branding.contactPhone ?? '');
+  const [customerWelcomeText, setCustomerWelcomeText] = useState(
+    activeTenant?.branding.customerWelcomeText ?? '',
   );
+  const [profileErrors, setProfileErrors] = useState<Record<string, string>>({});
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileSaveError, setProfileSaveError] = useState('');
+  const [brandingSaved, setBrandingSaved] = useState(false);
+  const [logoUploadError, setLogoUploadError] = useState('');
+  const [copiedPublicUrl, setCopiedPublicUrl] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(false);
 
+  // Google Review & Social Links fields
+  const [googleReviewUrl, setGoogleReviewUrl] = useState(
+    activeTenant?.reviewSocialLinks.googleReviewUrl ?? '',
+  );
+  const [instagramUrl, setInstagramUrl] = useState(
+    activeTenant?.reviewSocialLinks.instagramUrl ?? '',
+  );
+  const [youtubeUrl, setYoutubeUrl] = useState(
+    activeTenant?.reviewSocialLinks.youtubeUrl ?? '',
+  );
+  const [socialErrors, setSocialErrors] = useState<Record<string, string>>({});
+  const [socialSaving, setSocialSaving] = useState(false);
+  const [socialSaveError, setSocialSaveError] = useState('');
+  const [socialSaved, setSocialSaved] = useState(false);
+
+  // WhatsApp Settings fields
   const [phoneNumberId, setPhoneNumberId] = useState(
     activeTenant?.whatsappSettings.phoneNumberId ?? '',
   );
-  const [wabaId, setWabaId] = useState(
-    activeTenant?.whatsappSettings.wabaId ?? '',
-  );
+  const [wabaId, setWabaId] = useState(activeTenant?.whatsappSettings.wabaId ?? '');
   const [businessDisplayName, setBusinessDisplayName] = useState(
     activeTenant?.whatsappSettings.businessDisplayName ?? '',
   );
+  const [defaultMessage, setDefaultMessage] = useState(
+    activeTenant?.whatsappSettings.defaultMessage ?? '',
+  );
+  const [waSaving, setWaSaving] = useState(false);
+  const [waSaveError, setWaSaveError] = useState('');
+  const [waSaved, setWaSaved] = useState(false);
 
+  // Staff Account fields
   const [staffName, setStaffName] = useState('');
   const [staffEmail, setStaffEmail] = useState('');
   const [staffPassword, setStaffPassword] = useState('');
@@ -45,38 +139,191 @@ export function GarageSettingsPage() {
   } | null>(null);
   const [staffSubmitting, setStaffSubmitting] = useState(false);
 
-  const [brandingSaved, setBrandingSaved] = useState(false);
-  const [waSaved, setWaSaved] = useState(false);
+  // Sync form state whenever user switches active garage tenant
+  useEffect(() => {
+    if (!activeTenant) return;
+    setDisplayName(activeTenant.branding.displayName);
+    setSlug(activeTenant.slug);
+    setLogoUrl(activeTenant.branding.logoUrl);
+    setCity(activeTenant.branding.city);
+    setContactPhone(activeTenant.branding.contactPhone);
+    setCustomerWelcomeText(activeTenant.branding.customerWelcomeText ?? '');
+    setGoogleReviewUrl(activeTenant.reviewSocialLinks.googleReviewUrl);
+    setInstagramUrl(activeTenant.reviewSocialLinks.instagramUrl);
+    setYoutubeUrl(activeTenant.reviewSocialLinks.youtubeUrl);
+    setPhoneNumberId(activeTenant.whatsappSettings.phoneNumberId);
+    setWabaId(activeTenant.whatsappSettings.wabaId);
+    setBusinessDisplayName(activeTenant.whatsappSettings.businessDisplayName);
+    setDefaultMessage(activeTenant.whatsappSettings.defaultMessage ?? '');
+    setProfileErrors({});
+    setSocialErrors({});
+  }, [activeTenant?.id]);
+
+  const effectiveSlug = normalizeGarageSlug(slug || activeTenant?.slug || displayName);
+  const publicPath = buildPublicGaragePath(effectiveSlug);
+  const fullPublicUrl =
+    typeof window !== 'undefined' ? `${window.location.origin}${publicPath}` : publicPath;
+
+  const previewProfile = useMemo<PublicGarageConnectionProfile>(
+    () => ({
+      id: activeTenant?.id ?? '',
+      slug: effectiveSlug,
+      displayName: displayName.trim() || activeTenant?.branding.displayName || 'Garage',
+      logoUrl: logoUrl.trim(),
+      contactPhone: contactPhone.trim(),
+      address: city.trim(),
+      customerWelcomeText: customerWelcomeText.trim() || DEFAULT_CUSTOMER_WELCOME_TEXT,
+      googleReviewUrl: googleReviewUrl.trim(),
+      instagramUrl: instagramUrl.trim(),
+      youtubeUrl: youtubeUrl.trim(),
+    }),
+    [
+      activeTenant,
+      effectiveSlug,
+      displayName,
+      logoUrl,
+      contactPhone,
+      city,
+      customerWelcomeText,
+      googleReviewUrl,
+      instagramUrl,
+      youtubeUrl,
+    ],
+  );
 
   if (!activeTenant) return null;
 
   const canManage = canManageGarageStaff(session, activeTenant.id);
 
-  const handleSaveBranding = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!canManage || !displayName.trim()) return;
-    updateActiveBranding({
-      ...activeTenant.branding,
-      displayName: displayName.trim(),
-      tagline: tagline.trim(),
-      city: city.trim(),
-      contactPhone: contactPhone.trim(),
-    });
-    setBrandingSaved(true);
-    setTimeout(() => setBrandingSaved(false), 2500);
+  const handleLogoFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setLogoUploadError('');
+    if (!file.type.startsWith('image/')) {
+      setLogoUploadError('Please choose a PNG, JPG, WebP, or SVG logo image.');
+      return;
+    }
+    try {
+      const dataUrl = await fileToResizedDataUrl(file);
+      setLogoUrl(dataUrl);
+    } catch (err) {
+      setLogoUploadError(
+        err instanceof Error ? err.message : 'Unable to process selected logo file.',
+      );
+    } finally {
+      e.target.value = '';
+    }
   };
 
-  const handleSaveWhatsApp = (e: React.FormEvent) => {
+  const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!canManage) return;
-    updateActiveWhatsAppSettings({
-      phoneNumberId: phoneNumberId.trim(),
-      wabaId: wabaId.trim(),
-      businessDisplayName: businessDisplayName.trim() || activeTenant.branding.displayName,
-      connectionStatus: 'not_connected',
+    setProfileSaveError('');
+    setBrandingSaved(false);
+
+    const validation = validateGarageProfileSettingsInput(
+      {
+        displayName,
+        slug,
+        logoUrl,
+        contactPhone,
+        address: city,
+        customerWelcomeText,
+      },
+      activeTenant.id,
+      tenants,
+    );
+
+    if (!validation.valid) {
+      setProfileErrors(validation.errors);
+      return;
+    }
+
+    setProfileErrors({});
+    setProfileSaving(true);
+    try {
+      setSlug(validation.normalizedSlug);
+      await updateActiveBranding(
+        {
+          ...activeTenant.branding,
+          displayName: displayName.trim(),
+          logoUrl: logoUrl.trim(),
+          city: city.trim(),
+          contactPhone: contactPhone.trim(),
+          customerWelcomeText: customerWelcomeText.trim(),
+        },
+        validation.normalizedSlug,
+      );
+      setBrandingSaved(true);
+      setTimeout(() => setBrandingSaved(false), 3000);
+    } catch (err) {
+      setProfileSaveError(
+        err instanceof Error ? err.message : 'Unable to save garage profile settings.',
+      );
+    } finally {
+      setProfileSaving(false);
+    }
+  };
+
+  const handleSaveSocialLinks = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!canManage) return;
+    setSocialSaveError('');
+    setSocialSaved(false);
+
+    const validation = validateGarageSocialLinksInput({
+      googleReviewUrl,
+      instagramUrl,
+      youtubeUrl,
     });
-    setWaSaved(true);
-    setTimeout(() => setWaSaved(false), 2500);
+    if (!validation.valid) {
+      setSocialErrors(validation.errors);
+      return;
+    }
+
+    setSocialErrors({});
+    setSocialSaving(true);
+    try {
+      await updateActiveReviewLinks({
+        ...activeTenant.reviewSocialLinks,
+        googleReviewUrl: googleReviewUrl.trim(),
+        instagramUrl: instagramUrl.trim(),
+        youtubeUrl: youtubeUrl.trim(),
+      });
+      setSocialSaved(true);
+      setTimeout(() => setSocialSaved(false), 3000);
+    } catch (err) {
+      setSocialSaveError(
+        err instanceof Error ? err.message : 'Unable to save review and social URLs.',
+      );
+    } finally {
+      setSocialSaving(false);
+    }
+  };
+
+  const handleSaveWhatsApp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!canManage) return;
+    setWaSaveError('');
+    setWaSaved(false);
+    setWaSaving(true);
+    try {
+      await updateActiveWhatsAppSettings({
+        phoneNumberId: phoneNumberId.trim(),
+        wabaId: wabaId.trim(),
+        businessDisplayName: businessDisplayName.trim() || displayName.trim(),
+        defaultMessage: defaultMessage.trim(),
+        connectionStatus: 'not_connected',
+      });
+      setWaSaved(true);
+      setTimeout(() => setWaSaved(false), 3000);
+    } catch (err) {
+      setWaSaveError(
+        err instanceof Error ? err.message : 'Unable to save WhatsApp settings.',
+      );
+    } finally {
+      setWaSaving(false);
+    }
   };
 
   const handleCreateStaff = async (e: React.FormEvent) => {
@@ -111,6 +358,16 @@ export function GarageSettingsPage() {
     }
   };
 
+  const handleCopyPublicUrl = async () => {
+    try {
+      await navigator.clipboard.writeText(fullPublicUrl);
+      setCopiedPublicUrl(true);
+      setTimeout(() => setCopiedPublicUrl(false), 2000);
+    } catch {
+      // clipboard blocked in headless mode
+    }
+  };
+
   return (
     <div className="space-y-6">
       {!canManage && (
@@ -122,107 +379,371 @@ export function GarageSettingsPage() {
           <p>
             Read-only Garage Staff view. Only an authorized Garage Admin for{' '}
             <span className="font-semibold">{activeTenant.branding.displayName}</span> can
-            update garage settings or create staff accounts.
+            update garage settings, public links, or staff accounts.
           </p>
         </div>
       )}
 
-      {/* Garage Branding */}
+      {/* Public Customer Connection Page Banner & Preview Controls */}
+      <section className="flex flex-col gap-4 rounded-2xl border border-slate-200 bg-white p-6 lg:flex-row lg:items-center lg:justify-between">
+        <div className="space-y-1">
+          <h2 className="font-display text-base font-semibold text-slate-900">
+            Customer Connection Page URL
+          </h2>
+          <p className="text-sm text-slate-600">
+            Mobile-friendly public page displaying strictly{' '}
+            <span className="font-medium text-slate-900">{previewProfile.displayName}</span>{' '}
+            details and links.
+          </p>
+          <p className="font-mono text-xs text-navy-900 break-all">{fullPublicUrl}</p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+          <button
+            type="button"
+            onClick={() => void handleCopyPublicUrl()}
+            className="inline-flex min-h-[44px] items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-medium text-slate-800 hover:bg-slate-50 whitespace-nowrap"
+          >
+            <Copy className="h-4 w-4" aria-hidden="true" />
+            <span>{copiedPublicUrl ? 'Copied Link' : 'Copy Link'}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setPreviewOpen(true)}
+            className="inline-flex min-h-[44px] items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-medium text-slate-800 hover:bg-slate-50 whitespace-nowrap"
+          >
+            <Eye className="h-4 w-4" aria-hidden="true" />
+            <span>Preview Connection Page</span>
+          </button>
+
+          <a
+            href={publicPath}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-navy-900 px-4 text-sm font-medium text-white hover:bg-navy-800 whitespace-nowrap"
+          >
+            <span>Open Public Page</span>
+            <ExternalLink className="h-4 w-4" aria-hidden="true" />
+          </a>
+        </div>
+      </section>
+
+      {/* Section 1: Garage Profile, Logo, Address & Customer Welcome Text */}
       <section className="rounded-2xl border border-slate-200 bg-white p-6">
         <h2 className="font-display text-base font-semibold text-slate-900">
-          Garage Branding &amp; Profile
+          Garage Identity, Logo &amp; Welcome Message
         </h2>
         <p className="mt-1 text-sm text-slate-600">
-          Used in navigation headers and WhatsApp customer message templates for{' '}
-          <span className="font-medium text-slate-900">
-            {activeTenant.branding.displayName}
-          </span>
-          .
+          Configure how your workshop appears on your public Customer Connection Page and WhatsApp messages.
         </p>
 
-        <form onSubmit={handleSaveBranding} className="mt-5 grid gap-4 sm:grid-cols-2">
-          <div>
-            <label htmlFor="gs-name" className="block text-sm font-medium text-slate-700">
-              Garage Display Name
-            </label>
-            <input
-              id="gs-name"
-              type="text"
-              disabled={!canManage}
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              className="mt-1 min-h-[44px] w-full rounded-xl border border-slate-300 px-3.5 text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
-            />
+        <form onSubmit={(e) => void handleSaveProfile(e)} noValidate className="mt-5 space-y-5">
+          {/* Logo Upload + URL Preview Row */}
+          <div className="flex flex-col gap-4 border-b border-slate-100 pb-5 sm:flex-row sm:items-center">
+            <div className="flex h-20 w-20 shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-slate-200 bg-navy-900 text-white">
+              {logoUrl.trim() ? (
+                <img
+                  src={logoUrl.trim()}
+                  alt={`${displayName || activeTenant.branding.displayName} logo preview`}
+                  referrerPolicy="no-referrer"
+                  className="h-full w-full object-cover"
+                />
+              ) : (
+                <span className="font-display text-xl font-bold">
+                  {getInitials(displayName || activeTenant.branding.displayName)}
+                </span>
+              )}
+            </div>
+
+            <div className="flex-1 space-y-2">
+              <label htmlFor="gs-logo-url" className="block text-sm font-medium text-slate-700">
+                Garage Logo URL or Upload Image
+              </label>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <input
+                  id="gs-logo-url"
+                  type="url"
+                  disabled={!canManage}
+                  value={logoUrl}
+                  onChange={(e) => setLogoUrl(e.target.value)}
+                  placeholder="https://your-cdn.com/garage-logo.png"
+                  className="min-h-[44px] flex-1 rounded-xl border border-slate-300 px-3.5 text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
+                />
+                {canManage && (
+                  <div className="flex items-center gap-2 shrink-0">
+                    <label className="inline-flex min-h-[44px] cursor-pointer items-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-xs font-medium text-slate-800 hover:bg-slate-50 whitespace-nowrap">
+                      <Upload className="h-4 w-4" aria-hidden="true" />
+                      <span>Upload Logo</span>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        onChange={(e) => void handleLogoFileUpload(e)}
+                        className="sr-only"
+                      />
+                    </label>
+                    {logoUrl.trim() && (
+                      <button
+                        type="button"
+                        aria-label="Remove garage logo"
+                        onClick={() => setLogoUrl('')}
+                        className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl border border-slate-300 bg-white text-slate-600 hover:bg-slate-50"
+                      >
+                        <Trash2 className="h-4 w-4" aria-hidden="true" />
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+              {profileErrors.logoUrl && (
+                <p className="text-xs font-medium text-red-600">{profileErrors.logoUrl}</p>
+              )}
+              {logoUploadError && (
+                <p className="text-xs font-medium text-red-600">{logoUploadError}</p>
+              )}
+            </div>
           </div>
-          <div>
-            <label htmlFor="gs-city" className="block text-sm font-medium text-slate-700">
-              City / Address
-            </label>
-            <input
-              id="gs-city"
-              type="text"
-              disabled={!canManage}
-              value={city}
-              onChange={(e) => setCity(e.target.value)}
-              className="mt-1 min-h-[44px] w-full rounded-xl border border-slate-300 px-3.5 text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
-            />
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div>
+              <label htmlFor="gs-name" className="block text-sm font-medium text-slate-700">
+                Garage Name
+              </label>
+              <input
+                id="gs-name"
+                type="text"
+                disabled={!canManage}
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                className="mt-1 min-h-[44px] w-full rounded-xl border border-slate-300 px-3.5 text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
+              />
+              {profileErrors.displayName && (
+                <p className="mt-1 text-xs text-red-600">{profileErrors.displayName}</p>
+              )}
+            </div>
+
+            <div>
+              <label htmlFor="gs-slug" className="block text-sm font-medium text-slate-700">
+                Public Connection Slug
+              </label>
+              <div className="mt-1 flex items-center overflow-hidden rounded-xl border border-slate-300 focus-within:border-navy-900">
+                <span className="border-r border-slate-200 bg-slate-50 px-3 py-2.5 font-mono text-xs text-slate-500 whitespace-nowrap">
+                  /g/
+                </span>
+                <input
+                  id="gs-slug"
+                  type="text"
+                  disabled={!canManage}
+                  value={slug}
+                  onChange={(e) => setSlug(e.target.value)}
+                  onBlur={() => setSlug((prev) => normalizeGarageSlug(prev || displayName))}
+                  placeholder="apex-auto-care"
+                  className="min-h-[44px] w-full px-3 font-mono text-sm text-slate-900 focus:outline-none disabled:bg-slate-50 disabled:text-slate-500"
+                />
+              </div>
+              {profileErrors.slug && (
+                <p className="mt-1 text-xs text-red-600">{profileErrors.slug}</p>
+              )}
+            </div>
+
+            <div>
+              <label htmlFor="gs-phone" className="block text-sm font-medium text-slate-700">
+                Contact Phone Number
+              </label>
+              <input
+                id="gs-phone"
+                type="tel"
+                disabled={!canManage}
+                value={contactPhone}
+                onChange={(e) => setContactPhone(e.target.value)}
+                placeholder="+91 98200 11223"
+                className="mt-1 min-h-[44px] w-full rounded-xl border border-slate-300 px-3.5 text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
+              />
+              {profileErrors.contactPhone && (
+                <p className="mt-1 text-xs text-red-600">{profileErrors.contactPhone}</p>
+              )}
+            </div>
+
+            <div>
+              <label htmlFor="gs-city" className="block text-sm font-medium text-slate-700">
+                Workshop Address
+              </label>
+              <input
+                id="gs-city"
+                type="text"
+                disabled={!canManage}
+                value={city}
+                onChange={(e) => setCity(e.target.value)}
+                placeholder="Plot 12, Baner Road, Pune 411045"
+                className="mt-1 min-h-[44px] w-full rounded-xl border border-slate-300 px-3.5 text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
+              />
+            </div>
+
+            <div className="sm:col-span-2">
+              <div className="flex items-center justify-between gap-2">
+                <label htmlFor="gs-welcome" className="block text-sm font-medium text-slate-700">
+                  Customer Welcome Text
+                </label>
+                <span className="text-xs text-slate-500 tabular-nums">
+                  {customerWelcomeText.length}/500
+                </span>
+              </div>
+              <textarea
+                id="gs-welcome"
+                rows={3}
+                disabled={!canManage}
+                value={customerWelcomeText}
+                onChange={(e) => setCustomerWelcomeText(e.target.value)}
+                placeholder={DEFAULT_CUSTOMER_WELCOME_TEXT}
+                className="mt-1 w-full rounded-xl border border-slate-300 p-3.5 text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
+              />
+              {profileErrors.customerWelcomeText && (
+                <p className="mt-1 text-xs text-red-600">{profileErrors.customerWelcomeText}</p>
+              )}
+            </div>
           </div>
-          <div>
-            <label htmlFor="gs-tagline" className="block text-sm font-medium text-slate-700">
-              Service Tagline
-            </label>
-            <input
-              id="gs-tagline"
-              type="text"
-              disabled={!canManage}
-              value={tagline}
-              onChange={(e) => setTagline(e.target.value)}
-              className="mt-1 min-h-[44px] w-full rounded-xl border border-slate-300 px-3.5 text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
-            />
-          </div>
-          <div>
-            <label htmlFor="gs-phone" className="block text-sm font-medium text-slate-700">
-              Garage Contact Phone
-            </label>
-            <input
-              id="gs-phone"
-              type="tel"
-              disabled={!canManage}
-              value={contactPhone}
-              onChange={(e) => setContactPhone(e.target.value)}
-              className="mt-1 min-h-[44px] w-full rounded-xl border border-slate-300 px-3.5 text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
-            />
-          </div>
+
+          {profileSaveError && (
+            <p role="alert" className="text-xs font-medium text-red-600">
+              {profileSaveError}
+            </p>
+          )}
+
           {canManage && (
-            <div className="flex flex-wrap items-center justify-between gap-3 pt-2 sm:col-span-2">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4">
               <div>
                 {brandingSaved && (
                   <span className="inline-flex items-center gap-1.5 text-sm font-medium text-emerald-700">
                     <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
-                    Branding saved
+                    Garage profile &amp; welcome message saved
                   </span>
                 )}
               </div>
               <button
                 type="submit"
-                className="min-h-[44px] rounded-xl bg-navy-900 px-5 py-2 text-sm font-medium text-white hover:bg-navy-800"
+                disabled={profileSaving}
+                className="min-h-[44px] rounded-xl bg-navy-900 px-5 py-2 text-sm font-medium text-white hover:bg-navy-800 disabled:opacity-60 whitespace-nowrap"
               >
-                Save Branding
+                {profileSaving ? 'Saving...' : 'Save Garage Profile'}
               </button>
             </div>
           )}
         </form>
       </section>
 
-      {/* WhatsApp Cloud API Settings */}
+      {/* Section 2: Google Review & Social Links */}
+      <section className="rounded-2xl border border-slate-200 bg-white p-6">
+        <h2 className="font-display text-base font-semibold text-slate-900">
+          Google Review &amp; Social Media Links
+        </h2>
+        <p className="mt-1 text-sm text-slate-600">
+          All links are optional and appear only on {previewProfile.displayName}&apos;s Customer Connection Page. Google Reviews remain open equally to all customers with no incentives or feedback filtering.
+        </p>
+
+        <form onSubmit={(e) => void handleSaveSocialLinks(e)} noValidate className="mt-5 grid gap-4 sm:grid-cols-3">
+          <div>
+            <label
+              htmlFor="gs-google-review"
+              className="flex items-center gap-1.5 text-sm font-medium text-slate-700"
+            >
+              <Star className="h-4 w-4 text-amber-500" aria-hidden="true" />
+              <span>Google Review URL</span>
+            </label>
+            <input
+              id="gs-google-review"
+              type="url"
+              disabled={!canManage}
+              value={googleReviewUrl}
+              onChange={(e) => setGoogleReviewUrl(e.target.value)}
+              placeholder="https://g.page/r/your-garage/review"
+              className="mt-1 min-h-[44px] w-full rounded-xl border border-slate-300 px-3.5 text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
+            />
+            {socialErrors.googleReviewUrl && (
+              <p className="mt-1 text-xs text-red-600">{socialErrors.googleReviewUrl}</p>
+            )}
+          </div>
+
+          <div>
+            <label
+              htmlFor="gs-instagram"
+              className="flex items-center gap-1.5 text-sm font-medium text-slate-700"
+            >
+              <Instagram className="h-4 w-4 text-pink-600" aria-hidden="true" />
+              <span>Instagram Profile URL</span>
+            </label>
+            <input
+              id="gs-instagram"
+              type="url"
+              disabled={!canManage}
+              value={instagramUrl}
+              onChange={(e) => setInstagramUrl(e.target.value)}
+              placeholder="https://instagram.com/yourgarage"
+              className="mt-1 min-h-[44px] w-full rounded-xl border border-slate-300 px-3.5 text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
+            />
+            {socialErrors.instagramUrl && (
+              <p className="mt-1 text-xs text-red-600">{socialErrors.instagramUrl}</p>
+            )}
+          </div>
+
+          <div>
+            <label
+              htmlFor="gs-youtube"
+              className="flex items-center gap-1.5 text-sm font-medium text-slate-700"
+            >
+              <Youtube className="h-4 w-4 text-red-600" aria-hidden="true" />
+              <span>YouTube Channel URL</span>
+            </label>
+            <input
+              id="gs-youtube"
+              type="url"
+              disabled={!canManage}
+              value={youtubeUrl}
+              onChange={(e) => setYoutubeUrl(e.target.value)}
+              placeholder="https://youtube.com/@yourgarage"
+              className="mt-1 min-h-[44px] w-full rounded-xl border border-slate-300 px-3.5 text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
+            />
+            {socialErrors.youtubeUrl && (
+              <p className="mt-1 text-xs text-red-600">{socialErrors.youtubeUrl}</p>
+            )}
+          </div>
+
+          {socialSaveError && (
+            <p role="alert" className="text-xs font-medium text-red-600 sm:col-span-3">
+              {socialSaveError}
+            </p>
+          )}
+
+          {canManage && (
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4 sm:col-span-3">
+              <div>
+                {socialSaved && (
+                  <span className="inline-flex items-center gap-1.5 text-sm font-medium text-emerald-700">
+                    <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
+                    Review &amp; social links saved
+                  </span>
+                )}
+              </div>
+              <button
+                type="submit"
+                disabled={socialSaving}
+                className="min-h-[44px] rounded-xl bg-navy-900 px-5 py-2 text-sm font-medium text-white hover:bg-navy-800 disabled:opacity-60 whitespace-nowrap"
+              >
+                {socialSaving ? 'Saving...' : 'Save Review & Social Links'}
+              </button>
+            </div>
+          )}
+        </form>
+      </section>
+
+      {/* Section 3: WhatsApp Message Settings */}
       <section className="rounded-2xl border border-slate-200 bg-white p-6">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <h2 className="font-display text-base font-semibold text-slate-900">
-              WhatsApp Business Settings
+              WhatsApp Message Settings
             </h2>
             <p className="mt-1 text-sm text-slate-600">
-              Store this garage&apos;s Meta WhatsApp Cloud API identifiers separately from all other garages.
+              Store this garage&apos;s Meta WhatsApp Cloud API identifiers and default delivery greeting separately from all other garages.
             </p>
           </div>
           <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-700 whitespace-nowrap">
@@ -231,7 +752,7 @@ export function GarageSettingsPage() {
           </span>
         </div>
 
-        <form onSubmit={handleSaveWhatsApp} className="mt-5 grid gap-4 sm:grid-cols-3">
+        <form onSubmit={(e) => void handleSaveWhatsApp(e)} className="mt-5 grid gap-4 sm:grid-cols-3">
           <div>
             <label htmlFor="wa-phone-id" className="block text-sm font-medium text-slate-700">
               Phone Number ID
@@ -273,28 +794,51 @@ export function GarageSettingsPage() {
               className="mt-1 min-h-[44px] w-full rounded-xl border border-slate-300 px-3.5 text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
             />
           </div>
+
+          <div className="sm:col-span-3">
+            <label htmlFor="wa-default-msg" className="block text-sm font-medium text-slate-700">
+              Default WhatsApp Delivery Note
+            </label>
+            <textarea
+              id="wa-default-msg"
+              rows={2}
+              disabled={!canManage}
+              value={defaultMessage}
+              onChange={(e) => setDefaultMessage(e.target.value)}
+              placeholder="Hi {{customer_name}}, your {{vehicle_model}} ({{vehicle_reg}}) from {{garage_name}} is delivered! Connect with us: {{google_review_url}}"
+              className="mt-1 w-full rounded-xl border border-slate-300 p-3.5 text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
+            />
+          </div>
+
+          {waSaveError && (
+            <p role="alert" className="text-xs font-medium text-red-600 sm:col-span-3">
+              {waSaveError}
+            </p>
+          )}
+
           {canManage && (
             <div className="flex flex-wrap items-center justify-between gap-3 pt-2 sm:col-span-3">
               <div>
                 {waSaved && (
                   <span className="inline-flex items-center gap-1.5 text-sm font-medium text-emerald-700">
                     <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
-                    WhatsApp IDs stored (live dispatch still requires Edge Function)
+                    WhatsApp settings saved (live dispatch requires Edge Function)
                   </span>
                 )}
               </div>
               <button
                 type="submit"
-                className="min-h-[44px] rounded-xl bg-navy-900 px-5 py-2 text-sm font-medium text-white hover:bg-navy-800"
+                disabled={waSaving}
+                className="min-h-[44px] rounded-xl bg-navy-900 px-5 py-2 text-sm font-medium text-white hover:bg-navy-800 disabled:opacity-60 whitespace-nowrap"
               >
-                Save WhatsApp Settings
+                {waSaving ? 'Saving...' : 'Save WhatsApp Settings'}
               </button>
             </div>
           )}
         </form>
       </section>
 
-      {/* Tenant-Scoped Staff Account Creation */}
+      {/* Section 4: Tenant-Scoped Staff Account Creation */}
       <section className="rounded-2xl border border-slate-200 bg-white p-6">
         <div className="flex items-center gap-2">
           <UserPlus className="h-5 w-5 text-navy-900" aria-hidden="true" />
@@ -418,6 +962,68 @@ export function GarageSettingsPage() {
           ))}
         </ul>
       </section>
+
+      {/* Admin Live Preview Modal for Customer Connection Page */}
+      {previewOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/60 p-0 sm:items-center sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="connection-preview-title"
+        >
+          <div className="flex max-h-[90vh] w-full flex-col overflow-hidden rounded-t-3xl border border-slate-200 bg-slate-50 shadow-2xl sm:max-w-lg sm:rounded-3xl">
+            <div className="flex shrink-0 items-center justify-between border-b border-slate-200 bg-white px-5 py-3.5">
+              <div>
+                <h3
+                  id="connection-preview-title"
+                  className="font-display text-sm font-semibold text-slate-900"
+                >
+                  Live Customer Connection Preview
+                </h3>
+                <p className="font-mono text-xs text-slate-500">{publicPath}</p>
+              </div>
+              <button
+                type="button"
+                aria-label="Close connection page preview"
+                onClick={() => setPreviewOpen(false)}
+                className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-600 hover:bg-slate-50"
+              >
+                <X className="h-5 w-5" aria-hidden="true" />
+              </button>
+            </div>
+
+            <div className="flex-1 space-y-3 overflow-y-auto p-4 sm:p-5">
+              <CustomerConnectionCard profile={previewProfile} isPreview />
+              {(!previewProfile.googleReviewUrl ||
+                !previewProfile.instagramUrl ||
+                !previewProfile.youtubeUrl) && (
+                <p className="text-center text-xs text-slate-500">
+                  Optional links left blank remain hidden on the live customer page.
+                </p>
+              )}
+            </div>
+
+            <div className="flex shrink-0 items-center justify-between gap-2.5 border-t border-slate-200 bg-white px-5 py-3.5">
+              <a
+                href={publicPath}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-xl border border-slate-300 bg-white px-4 text-sm font-medium text-slate-800 hover:bg-slate-50 whitespace-nowrap"
+              >
+                <ExternalLink className="h-4 w-4 text-slate-600" aria-hidden="true" />
+                <span>Open /g/{effectiveSlug}</span>
+              </a>
+              <button
+                type="button"
+                onClick={() => setPreviewOpen(false)}
+                className="min-h-[44px] rounded-xl bg-navy-900 px-5 text-sm font-medium text-white hover:bg-navy-800 whitespace-nowrap"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

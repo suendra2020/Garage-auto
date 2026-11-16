@@ -86,7 +86,16 @@ export function filterDeliveredVehicles(
   jobCards: readonly JobCard[],
   activeTenantId: string | null | undefined,
 ): JobCard[] {
-  return scopeByTenant(jobCards, activeTenantId).filter((card) => card.isDelivered);
+  return scopeByTenant(jobCards, activeTenantId).filter((card) => {
+    if (!card.isDelivered || !isDeliveredStatus(card.rawStatus) || !card.deliveredAt) {
+      return false;
+    }
+    const lower = card.rawStatus.trim().toLowerCase();
+    if (['cancel', 'canceled', 'cancelled', 'void', 'rejected'].some((t) => lower.includes(t))) {
+      return false;
+    }
+    return !Number.isNaN(new Date(card.deliveredAt).getTime());
+  });
 }
 
 const DELIVERED_POSITIVE_TOKENS = [

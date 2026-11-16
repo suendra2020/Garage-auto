@@ -8,6 +8,7 @@ import type {
   JobCard,
   MessageTemplate,
   PlatformRole,
+  PublicGarageConnectionProfile,
   StaffCreationInput,
   TemplateCategory,
   TenantUser,
@@ -15,11 +16,17 @@ import type {
   WhatsAppMessageLog,
 } from '../types/garage';
 import { chunkArray } from '../utils/excelImportEngine';
+import {
+  DEFAULT_CUSTOMER_WELCOME_TEXT,
+  buildPublicGarageProfile,
+  normalizeGarageSlug,
+} from '../utils/garageConnection';
 import { generateSlug, isDeliveredStatus } from '../utils/tenantLogic';
 
 interface DbGarageRow {
   id: string;
   garage_name: string;
+  slug?: string | null;
   logo_url: string | null;
   address: string | null;
   phone_number: string | null;
@@ -27,7 +34,11 @@ interface DbGarageRow {
   google_review_url: string | null;
   instagram_url: string | null;
   youtube_url: string | null;
+  customer_welcome_text?: string | null;
   whatsapp_phone_number_id: string | null;
+  whatsapp_waba_id?: string | null;
+  whatsapp_display_name?: string | null;
+  whatsapp_default_message?: string | null;
   subscription_plan: string;
   account_status: GarageStatus;
   created_at: string;
@@ -63,11 +74,54 @@ export function writeLocalGarageImportMapping(
   }
 }
 
+const PUBLIC_GARAGE_CACHE_PREFIX = 'gc_public_garage_slug_';
+
+export function writeLocalPublicGarageCache(
+  profile: PublicGarageConnectionProfile,
+  previousSlug?: string | null,
+): void {
+  if (typeof window === 'undefined' || !profile.slug) return;
+  try {
+    if (previousSlug) {
+      const prevNorm = normalizeGarageSlug(previousSlug);
+      if (prevNorm && prevNorm !== profile.slug) {
+        localStorage.removeItem(`${PUBLIC_GARAGE_CACHE_PREFIX}${prevNorm}`);
+      }
+    }
+    localStorage.setItem(
+      `${PUBLIC_GARAGE_CACHE_PREFIX}${normalizeGarageSlug(profile.slug)}`,
+      JSON.stringify(profile),
+    );
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function readLocalPublicGarageCache(
+  slug: string,
+): PublicGarageConnectionProfile | null {
+  if (typeof window === 'undefined' || !slug) return null;
+  const targetSlug = normalizeGarageSlug(slug);
+  if (!targetSlug) return null;
+  try {
+    const raw = localStorage.getItem(`${PUBLIC_GARAGE_CACHE_PREFIX}${targetSlug}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as PublicGarageConnectionProfile;
+    if (normalizeGarageSlug(parsed.slug) !== targetSlug) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 function mapDbGarageToTenant(row: DbGarageRow): GarageTenant {
-  return {
+  const effectiveSlug = normalizeGarageSlug(row.slug || '') || generateSlug(row.garage_name);
+  const tenant: GarageTenant = {
     id: row.id,
     name: row.garage_name,
-    slug: generateSlug(row.garage_name),
+    slug: effectiveSlug,
     planId: row.subscription_plan || 'plan_starter',
     status: row.account_status,
     createdAt: row.created_at,
@@ -80,11 +134,13 @@ function mapDbGarageToTenant(row: DbGarageRow): GarageTenant {
       contactEmail: row.email ?? '',
       logoUrl: row.logo_url ?? '',
       accentColor: '#0B192C',
+      customerWelcomeText: row.customer_welcome_text ?? '',
     },
     whatsappSettings: {
       phoneNumberId: row.whatsapp_phone_number_id ?? '',
-      wabaId: '',
-      businessDisplayName: row.garage_name,
+      wabaId: row.whatsapp_waba_id ?? '',
+      businessDisplayName: row.whatsapp_display_name || row.garage_name,
+      defaultMessage: row.whatsapp_default_message ?? '',
       connectionStatus: 'not_connected',
     },
     reviewSocialLinks: {
@@ -95,6 +151,11 @@ function mapDbGarageToTenant(row: DbGarageRow): GarageTenant {
       websiteUrl: '',
     },
   };
+
+  if (row.account_status === 'active') {
+    writeLocalPublicGarageCache(buildPublicGarageProfile(tenant));
+  }
+  return tenant;
 }
 
 export async function signInSupabasePassword(email: string, password: string) {
@@ -515,6 +576,9 @@ export async function fetchSupabaseGarageScopedData(garageId: string): Promise<{
     rawStatus: r.job_card_status,
     isDelivered: isDeliveredStatus(r.job_card_status) && Boolean(r.delivery_date),
     deliveredAt: r.delivery_date,
+    deliveredBy: ((r as Record<string, unknown>).delivered_by as string | null | undefined) ?? null,
+    deliveryConfirmedAt:
+      ((r as Record<string, unknown>).delivery_confirmed_at as string | null | undefined) ?? null,
     serviceAdvisor: (r as Record<string, unknown>).service_advisor as string | undefined,
     invoiceNumber: (r as Record<string, unknown>).invoice_number as string | undefined,
     amount:
@@ -605,21 +669,46 @@ export async function fetchSupabaseGarageScopedData(garageId: string): Promise<{
   };
 }
 
-export async function updateSupabaseJobCardStatus(
-  garageId: string,
-  jobCardId: string,
-  isDelivered: boolean,
-) {
+export async function updateSupabaseJobCardDelivery(params: {
+  garageId: string;
+  jobCardId: string;
+  isDelivered: boolean;
+  deliveredAt: string | null;
+  deliveredBy: string | null;
+  deliveryConfirmedAt: string | null;
+}) {
   const client = getSupabaseClient();
   if (!client) return;
-  const { error } = await client
+
+  const fullUpdate = {
+    job_card_status: params.isDelivered ? 'Delivered' : 'In Progress',
+    delivery_date: params.isDelivered ? params.deliveredAt : null,
+    delivered_by: params.isDelivered ? params.deliveredBy : null,
+    delivery_confirmed_at: params.isDelivered ? params.deliveryConfirmedAt : null,
+  };
+
+  let { error } = await client
     .from('job_cards')
-    .update({
-      job_card_status: isDelivered ? 'Delivered' : 'In Progress',
-      delivery_date: isDelivered ? new Date().toISOString() : null,
-    })
-    .eq('id', jobCardId)
-    .eq('garage_id', garageId);
+    .update(fullUpdate)
+    .eq('id', params.jobCardId)
+    .eq('garage_id', params.garageId);
+
+  if (
+    error &&
+    (error.message.includes('delivered_by') ||
+      error.message.includes('delivery_confirmed_at'))
+  ) {
+    const fallbackRes = await client
+      .from('job_cards')
+      .update({
+        job_card_status: fullUpdate.job_card_status,
+        delivery_date: fullUpdate.delivery_date,
+      })
+      .eq('id', params.jobCardId)
+      .eq('garage_id', params.garageId);
+    error = fallbackRes.error;
+  }
+
   if (error) throw error;
 }
 
@@ -627,20 +716,28 @@ export async function insertSupabaseWhatsAppLogDraft(
   garageId: string,
   log: WhatsAppMessageLog,
 ) {
+  await insertSupabaseWhatsAppLogDrafts(garageId, [log]);
+}
+
+export async function insertSupabaseWhatsAppLogDrafts(
+  garageId: string,
+  logs: readonly WhatsAppMessageLog[],
+) {
   const client = getSupabaseClient();
-  if (!client) return;
-  const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-    log.jobCardId,
-  );
-  const { error } = await client.from('whatsapp_logs').insert({
+  if (!client || logs.length === 0) return;
+
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const rows = logs.map((log) => ({
     garage_id: garageId,
-    job_card_id: isUuid ? log.jobCardId : null,
+    job_card_id: uuidRegex.test(log.jobCardId) ? log.jobCardId : null,
     recipient_number: log.phoneNumber,
     message_type: log.templateName,
     message_status: 'draft_not_sent',
     sent_at: log.createdAt,
     error_message: log.renderedMessage,
-  });
+  }));
+
+  const { error } = await client.from('whatsapp_logs').insert(rows);
   if (error) throw error;
 }
 
@@ -752,6 +849,7 @@ export async function updateSupabaseGarageFields(
   garageId: string,
   updates: Partial<{
     garage_name: string;
+    slug: string;
     logo_url: string;
     address: string;
     phone_number: string;
@@ -759,12 +857,95 @@ export async function updateSupabaseGarageFields(
     google_review_url: string;
     instagram_url: string;
     youtube_url: string;
+    customer_welcome_text: string;
     whatsapp_phone_number_id: string;
+    whatsapp_waba_id: string;
+    whatsapp_display_name: string;
+    whatsapp_default_message: string;
     account_status: GarageStatus;
   }>,
 ) {
   const client = getSupabaseClient();
   if (!client) return;
-  const { error } = await client.from('garages').update(updates).eq('id', garageId);
+
+  let { error } = await client.from('garages').update(updates).eq('id', garageId);
+
+  if (error?.code === '23505' || error?.message.toLowerCase().includes('duplicate key')) {
+    throw new Error('This public URL slug is already taken by another garage.');
+  }
+
+  if (
+    error &&
+    (error.message.includes('slug') ||
+      error.message.includes('customer_welcome_text') ||
+      error.message.includes('whatsapp_waba_id') ||
+      error.message.includes('whatsapp_display_name') ||
+      error.message.includes('whatsapp_default_message'))
+  ) {
+    const coreUpdates: Record<string, unknown> = {};
+    if (updates.garage_name !== undefined) coreUpdates.garage_name = updates.garage_name;
+    if (updates.logo_url !== undefined) coreUpdates.logo_url = updates.logo_url;
+    if (updates.address !== undefined) coreUpdates.address = updates.address;
+    if (updates.phone_number !== undefined) coreUpdates.phone_number = updates.phone_number;
+    if (updates.email !== undefined) coreUpdates.email = updates.email;
+    if (updates.google_review_url !== undefined) coreUpdates.google_review_url = updates.google_review_url;
+    if (updates.instagram_url !== undefined) coreUpdates.instagram_url = updates.instagram_url;
+    if (updates.youtube_url !== undefined) coreUpdates.youtube_url = updates.youtube_url;
+    if (updates.whatsapp_phone_number_id !== undefined) {
+      coreUpdates.whatsapp_phone_number_id = updates.whatsapp_phone_number_id;
+    }
+    if (updates.account_status !== undefined) coreUpdates.account_status = updates.account_status;
+
+    if (Object.keys(coreUpdates).length > 0) {
+      const fallbackRes = await client.from('garages').update(coreUpdates).eq('id', garageId);
+      error = fallbackRes.error;
+    } else {
+      error = null;
+    }
+  }
+
   if (error) throw error;
+}
+
+export async function fetchPublicGarageConnectionBySlug(
+  slug: string,
+): Promise<PublicGarageConnectionProfile | null> {
+  const targetSlug = normalizeGarageSlug(slug);
+  if (!targetSlug) return null;
+
+  const client = getSupabaseClient();
+  if (client) {
+    try {
+      const { data, error } = await client.rpc('get_public_garage_connection_page', {
+        p_slug: targetSlug,
+      });
+
+      if (!error && Array.isArray(data) && data.length > 0) {
+        const row = data[0] as Record<string, unknown>;
+        const resolvedSlug = normalizeGarageSlug(String(row.slug ?? ''));
+        if (resolvedSlug === targetSlug) {
+          const profile: PublicGarageConnectionProfile = {
+            id: String(row.id ?? ''),
+            slug: resolvedSlug,
+            displayName: String(row.garage_name ?? ''),
+            logoUrl: String(row.logo_url ?? ''),
+            contactPhone: String(row.phone_number ?? ''),
+            address: String(row.address ?? ''),
+            customerWelcomeText:
+              String(row.customer_welcome_text ?? '').trim() ||
+              DEFAULT_CUSTOMER_WELCOME_TEXT,
+            googleReviewUrl: String(row.google_review_url ?? ''),
+            instagramUrl: String(row.instagram_url ?? ''),
+            youtubeUrl: String(row.youtube_url ?? ''),
+          };
+          writeLocalPublicGarageCache(profile);
+          return profile;
+        }
+      }
+    } catch {
+      // Fall through to exact slug-keyed local cache when RPC migration 0006 isn't applied yet
+    }
+  }
+
+  return readLocalPublicGarageCache(targetSlug);
 }

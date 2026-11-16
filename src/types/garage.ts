@@ -39,12 +39,14 @@ export interface GarageBranding {
   contactEmail: string;
   logoUrl: string;
   accentColor: string;
+  customerWelcomeText?: string;
 }
 
 export interface GarageWhatsAppSettings {
   phoneNumberId: string;
   wabaId: string;
   businessDisplayName: string;
+  defaultMessage?: string;
   connectionStatus: IntegrationConnectionState;
 }
 
@@ -54,6 +56,19 @@ export interface ReviewSocialLinks {
   facebookUrl: string;
   youtubeUrl: string;
   websiteUrl: string;
+}
+
+export interface PublicGarageConnectionProfile {
+  id: string;
+  slug: string;
+  displayName: string;
+  logoUrl: string;
+  contactPhone: string;
+  address: string;
+  customerWelcomeText: string;
+  googleReviewUrl: string;
+  instagramUrl: string;
+  youtubeUrl: string;
 }
 
 export interface GarageTenant {
@@ -120,6 +135,8 @@ export interface JobCard {
   rawStatus: string;
   isDelivered: boolean;
   deliveredAt: string | null;
+  deliveredBy?: string | null;
+  deliveryConfirmedAt?: string | null;
   serviceAdvisor?: string;
   invoiceNumber?: string;
   amount?: number | null;

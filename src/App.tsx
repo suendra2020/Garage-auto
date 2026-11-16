@@ -17,9 +17,20 @@ import { ReviewSocialLinksPage } from './components/garage/ReviewSocialLinksPage
 import { ReportsPage } from './components/garage/ReportsPage';
 import { GarageSettingsPage } from './components/garage/GarageSettingsPage';
 import { UserProfilePage } from './components/common/UserProfilePage';
+import { PublicGarageConnectionPage } from './components/public/PublicGarageConnectionPage';
+import { parsePublicGarageSlugFromPath } from './utils/garageConnection';
 
 function WorkspaceRouter() {
   const { session, activeTenant, superAdminPage, garagePage } = useAppState();
+
+  const publicSlug =
+    typeof window !== 'undefined'
+      ? parsePublicGarageSlugFromPath(window.location.pathname)
+      : null;
+
+  if (publicSlug) {
+    return <PublicGarageConnectionPage slug={publicSlug} />;
+  }
 
   if (!session) {
     return <LoginScreen />;
