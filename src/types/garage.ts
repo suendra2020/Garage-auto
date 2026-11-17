@@ -48,6 +48,10 @@ export interface GarageWhatsAppSettings {
   businessDisplayName: string;
   defaultMessage?: string;
   connectionStatus: IntegrationConnectionState;
+  verifiedAt?: string | null;
+  verifiedPhoneNumber?: string | null;
+  verifiedName?: string | null;
+  lastTestError?: string | null;
 }
 
 export interface ReviewSocialLinks {
@@ -172,6 +176,7 @@ export interface MessageTemplate {
   category: TemplateCategory;
   body: string;
   metaTemplateName: string;
+  metaLanguageCode?: string;
   approvalStatus: 'draft' | 'pending' | 'approved' | 'rejected';
   updatedAt: string;
 }
@@ -180,11 +185,20 @@ export interface WhatsAppMessageLog {
   id: string;
   tenantId: string;
   jobCardId: string;
+  jobCardNumber?: string;
   customerName: string;
   phoneNumber: string;
   vehicleRegistration: string;
+  templateId?: string | null;
   templateName: string;
+  metaTemplateName?: string | null;
   renderedMessage: string;
+  whatsappMessageId?: string | null;
+  errorMessage?: string | null;
+  deliveredAt?: string | null;
+  readAt?: string | null;
+  failedAt?: string | null;
+  statusUpdatedAt?: string | null;
   status:
     | 'draft_not_sent_api_disconnected'
     | 'draft_not_sent'

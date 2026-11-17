@@ -4,23 +4,31 @@ import { getSupabaseClient, isSupabaseConfigured } from '../lib/supabase';
 import {
   createStaffAccountSupabase,
   createSupabaseGarageWorkspace,
+  deleteSupabaseWhatsAppTemplate,
   fetchSupabaseGarageScopedData,
   fetchSupabaseSuperAdminData,
+  fetchSupabaseWhatsAppLogs,
   insertSupabaseImportAndJobCards,
   insertSupabaseWhatsAppLogDrafts,
   loadSupabaseAuthenticatedContext,
   registerGarageOwnerSupabase,
   resendVerificationEmailSupabase,
   saveSupabaseGarageImportMapping,
+  saveSupabaseWhatsAppTemplate,
+  sendLiveWhatsAppBatchSupabaseEdge,
   sendPasswordResetEmailSupabase,
   signInSupabasePassword,
   signOutSupabase,
+  syncMetaTemplatesSupabaseEdge,
+  testWhatsAppConnectionSupabaseEdge,
   updatePasswordSupabase,
   updateProfileNameSupabase,
   updateSupabaseGarageFields,
   updateSupabaseJobCardDelivery,
   writeLocalGarageImportMapping,
   writeLocalPublicGarageCache,
+  type LiveWhatsAppBatchResponse,
+  type WhatsAppConnectionTestResponse,
 } from '../services/supabaseGarageService';
 import type {
   AuthScreenView,
@@ -225,8 +233,19 @@ interface AppStateContextValue {
     name: string;
     category: TemplateCategory;
     body: string;
-  }) => void;
-  deleteTemplateForActiveTenant: (templateId: string) => void;
+    metaTemplateName?: string;
+    metaLanguageCode?: string;
+    approvalStatus?: 'draft' | 'pending' | 'approved' | 'rejected';
+  }) => Promise<MessageTemplate | null>;
+  deleteTemplateForActiveTenant: (templateId: string) => Promise<void>;
+  syncActiveMetaTemplates: () => Promise<number>;
+
+  testActiveWhatsAppConnection: () => Promise<WhatsAppConnectionTestResponse>;
+  sendLiveWhatsAppMessages: (input: {
+    templateId: string;
+    jobCardIds: string[];
+  }) => Promise<LiveWhatsAppBatchResponse>;
+  refreshActiveWhatsAppLogs: () => Promise<void>;
 
   updateActiveBranding: (branding: GarageBranding, nextSlug?: string) => Promise<void>;
   updateActiveWhatsAppSettings: (settings: GarageWhatsAppSettings) => Promise<void>;
@@ -1272,56 +1291,202 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     return created[0] ?? null;
   };
 
-  const saveTemplateForActiveTenant = (input: {
+  const saveTemplateForActiveTenant = async (input: {
     id?: string;
     name: string;
     category: TemplateCategory;
     body: string;
-  }) => {
-    if (!activeTenantId) return;
+    metaTemplateName?: string;
+    metaLanguageCode?: string;
+    approvalStatus?: 'draft' | 'pending' | 'approved' | 'rejected';
+  }): Promise<MessageTemplate | null> => {
+    if (!activeTenantId || !canUserAccessTenant(state.session, activeTenantId)) return null;
     const now = new Date().toISOString();
+    const existing = input.id
+      ? state.templates.find((t) => t.id === input.id && t.tenantId === activeTenantId)
+      : undefined;
 
-    if (input.id) {
-      setState((prev) => ({
-        ...prev,
-        templates: prev.templates.map((t) =>
-          t.id === input.id && t.tenantId === activeTenantId
-            ? {
-                ...t,
-                name: input.name.trim(),
-                category: input.category,
-                body: input.body,
-                updatedAt: now,
-              }
-            : t,
-        ),
-      }));
-    } else {
-      const created: MessageTemplate = {
-        id: `tpl_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
-        tenantId: activeTenantId,
-        name: input.name.trim(),
-        category: input.category,
-        body: input.body,
-        metaTemplateName: generateSlug(input.name),
-        approvalStatus: 'draft',
-        updatedAt: now,
-      };
-      setState((prev) => ({
-        ...prev,
-        templates: [created, ...prev.templates],
-      }));
-    }
+    const draftModel: MessageTemplate = existing
+      ? {
+          ...existing,
+          name: input.name.trim(),
+          category: input.category,
+          body: input.body,
+          metaTemplateName:
+            input.metaTemplateName !== undefined
+              ? input.metaTemplateName.trim()
+              : existing.metaTemplateName,
+          metaLanguageCode:
+            input.metaLanguageCode !== undefined
+              ? input.metaLanguageCode.trim() || 'en'
+              : existing.metaLanguageCode || 'en',
+          approvalStatus: input.approvalStatus ?? existing.approvalStatus,
+          updatedAt: now,
+        }
+      : {
+          id: `tpl_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
+          tenantId: activeTenantId,
+          name: input.name.trim(),
+          category: input.category,
+          body: input.body,
+          metaTemplateName: input.metaTemplateName?.trim() || generateSlug(input.name).replaceAll('-', '_'),
+          metaLanguageCode: input.metaLanguageCode?.trim() || 'en',
+          approvalStatus: input.approvalStatus ?? 'draft',
+          updatedAt: now,
+        };
+
+    const persisted =
+      supabaseConfigured && state.session?.authMode === 'supabase'
+        ? await saveSupabaseWhatsAppTemplate(activeTenantId, draftModel)
+        : draftModel;
+
+    setState((prev) => ({
+      ...prev,
+      templates: existing
+        ? prev.templates.map((t) =>
+            t.id === existing.id && t.tenantId === activeTenantId ? persisted : t,
+          )
+        : [persisted, ...prev.templates],
+    }));
+
+    return persisted;
   };
 
-  const deleteTemplateForActiveTenant = (templateId: string) => {
-    if (!activeTenantId) return;
+  const deleteTemplateForActiveTenant = async (templateId: string) => {
+    if (!activeTenantId || !canManageGarageStaff(state.session, activeTenantId)) {
+      throw new Error('Only an authorized Garage Admin can delete message templates.');
+    }
+    if (supabaseConfigured && state.session?.authMode === 'supabase') {
+      await deleteSupabaseWhatsAppTemplate(activeTenantId, templateId);
+    }
     setState((prev) => ({
       ...prev,
       templates: prev.templates.filter(
         (t) => !(t.id === templateId && t.tenantId === activeTenantId),
       ),
     }));
+  };
+
+  const syncActiveMetaTemplates = async (): Promise<number> => {
+    if (!activeTenantId || !activeTenant || !canUserAccessTenant(state.session, activeTenantId)) {
+      throw new Error('Unauthorized garage template sync.');
+    }
+    if (!supabaseConfigured || state.session?.authMode !== 'supabase') {
+      throw new Error('Live Meta template sync requires an active Supabase session.');
+    }
+
+    const { templates: remoteTemplates } = await syncMetaTemplatesSupabaseEdge(activeTenantId);
+    let syncedCount = 0;
+
+    for (const remote of remoteTemplates) {
+      const existing = state.templates.find(
+        (t) =>
+          t.tenantId === activeTenantId &&
+          t.metaTemplateName.trim().toLowerCase() === remote.metaTemplateName.trim().toLowerCase(),
+      );
+      const mappedCategory: TemplateCategory = existing?.category ?? 'delivery_notification';
+      await saveTemplateForActiveTenant({
+        id: existing?.id,
+        name: existing?.name || remote.metaTemplateName.replaceAll('_', ' '),
+        category: mappedCategory,
+        body: remote.body || existing?.body || '',
+        metaTemplateName: remote.metaTemplateName,
+        metaLanguageCode: remote.languageCode || 'en',
+        approvalStatus: remote.approvalStatus,
+      });
+      syncedCount += 1;
+    }
+
+    return syncedCount;
+  };
+
+  const testActiveWhatsAppConnection = async (): Promise<WhatsAppConnectionTestResponse> => {
+    if (!activeTenantId || !activeTenant || !canManageGarageStaff(state.session, activeTenantId)) {
+      throw new Error('Only an authorized Garage Admin can test the WhatsApp connection.');
+    }
+    if (!supabaseConfigured || state.session?.authMode !== 'supabase') {
+      throw new Error(
+        'Cannot verify Meta Cloud API offline: configure Supabase and deploy the whatsapp-dispatch Edge Function.',
+      );
+    }
+
+    try {
+      const result = await testWhatsAppConnectionSupabaseEdge(activeTenantId);
+      const nextStatus = result.connected ? 'connected' : 'not_connected';
+      setState((prev) => ({
+        ...prev,
+        tenants: prev.tenants.map((t) =>
+          t.id === activeTenantId
+            ? {
+                ...t,
+                whatsappSettings: {
+                  ...t.whatsappSettings,
+                  connectionStatus: nextStatus,
+                  verifiedAt: result.connected ? result.verifiedAt ?? new Date().toISOString() : null,
+                  verifiedPhoneNumber: result.connected ? result.verifiedPhoneNumber ?? null : null,
+                  verifiedName: result.connected ? result.verifiedName ?? null : null,
+                  lastTestError: result.connected ? null : result.error ?? 'Connection test failed.',
+                },
+              }
+            : t,
+        ),
+      }));
+      return result;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : 'WhatsApp Cloud API test failed.';
+      setState((prev) => ({
+        ...prev,
+        tenants: prev.tenants.map((t) =>
+          t.id === activeTenantId
+            ? {
+                ...t,
+                whatsappSettings: {
+                  ...t.whatsappSettings,
+                  connectionStatus: 'not_connected',
+                  verifiedAt: null,
+                  lastTestError: errMsg,
+                },
+              }
+            : t,
+        ),
+      }));
+      throw err;
+    }
+  };
+
+  const refreshActiveWhatsAppLogs = async (): Promise<void> => {
+    if (!activeTenantId || !supabaseConfigured || state.session?.authMode !== 'supabase') return;
+    const latestLogs = await fetchSupabaseWhatsAppLogs(activeTenantId);
+    setState((prev) => ({
+      ...prev,
+      whatsappLogs: [
+        ...latestLogs,
+        ...prev.whatsappLogs.filter((l) => l.tenantId !== activeTenantId),
+      ],
+    }));
+  };
+
+  const sendLiveWhatsAppMessages = async (input: {
+    templateId: string;
+    jobCardIds: string[];
+  }): Promise<LiveWhatsAppBatchResponse> => {
+    if (!activeTenantId || !activeTenant || !canUserAccessTenant(state.session, activeTenantId)) {
+      throw new Error('Unauthorized garage dispatch request.');
+    }
+    if (!supabaseConfigured || state.session?.authMode !== 'supabase') {
+      throw new Error(
+        'Live WhatsApp Cloud API dispatch requires an authenticated Supabase session and deployed whatsapp-dispatch Edge Function.',
+      );
+    }
+
+    const result = await sendLiveWhatsAppBatchSupabaseEdge({
+      garageId: activeTenantId,
+      templateId: input.templateId,
+      jobCardIds: input.jobCardIds,
+    });
+
+    await refreshActiveWhatsAppLogs();
+    return result;
   };
 
   const updateActiveBranding = async (branding: GarageBranding, nextSlug?: string) => {
@@ -1364,18 +1529,44 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
     if (!activeTenantId || !activeTenant || !canManageGarageStaff(state.session, activeTenantId)) {
       throw new Error('Only an authorized Garage Admin can update WhatsApp settings.');
     }
+
+    const idsChanged =
+      whatsappSettings.phoneNumberId.trim() !== activeTenant.whatsappSettings.phoneNumberId.trim() ||
+      whatsappSettings.wabaId.trim() !== activeTenant.whatsappSettings.wabaId.trim();
+
+    // Changing Phone Number ID or WABA ID invalidates previous verification until re-tested!
+    const nextSettings: GarageWhatsAppSettings = idsChanged
+      ? {
+          ...whatsappSettings,
+          connectionStatus: 'not_connected',
+          verifiedAt: null,
+          verifiedPhoneNumber: null,
+          verifiedName: null,
+          lastTestError: null,
+        }
+      : whatsappSettings;
+
     if (supabaseConfigured && state.session?.authMode === 'supabase') {
       await updateSupabaseGarageFields(activeTenantId, {
-        whatsapp_phone_number_id: whatsappSettings.phoneNumberId,
-        whatsapp_waba_id: whatsappSettings.wabaId,
-        whatsapp_display_name: whatsappSettings.businessDisplayName,
-        whatsapp_default_message: whatsappSettings.defaultMessage ?? '',
+        whatsapp_phone_number_id: nextSettings.phoneNumberId,
+        whatsapp_waba_id: nextSettings.wabaId,
+        whatsapp_display_name: nextSettings.businessDisplayName,
+        whatsapp_default_message: nextSettings.defaultMessage ?? '',
+        ...(idsChanged
+          ? {
+              whatsapp_connection_status: 'not_connected',
+              whatsapp_verified_at: null,
+              whatsapp_verified_phone_number: null,
+              whatsapp_verified_name: null,
+              whatsapp_last_test_error: null,
+            }
+          : {}),
       });
     }
     setState((prev) => ({
       ...prev,
       tenants: prev.tenants.map((t) =>
-        t.id === activeTenantId ? { ...t, whatsappSettings } : t,
+        t.id === activeTenantId ? { ...t, whatsappSettings: nextSettings } : t,
       ),
     }));
   };
@@ -1481,6 +1672,10 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
         prepareWhatsAppDraftsForCards,
         saveTemplateForActiveTenant,
         deleteTemplateForActiveTenant,
+        syncActiveMetaTemplates,
+        testActiveWhatsAppConnection,
+        sendLiveWhatsAppMessages,
+        refreshActiveWhatsAppLogs,
         updateActiveBranding,
         updateActiveWhatsAppSettings,
         updateActiveReviewLinks,

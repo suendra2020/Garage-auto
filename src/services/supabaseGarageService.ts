@@ -39,6 +39,11 @@ interface DbGarageRow {
   whatsapp_waba_id?: string | null;
   whatsapp_display_name?: string | null;
   whatsapp_default_message?: string | null;
+  whatsapp_connection_status?: 'not_connected' | 'pending_setup' | 'connected' | null;
+  whatsapp_verified_at?: string | null;
+  whatsapp_verified_phone_number?: string | null;
+  whatsapp_verified_name?: string | null;
+  whatsapp_last_test_error?: string | null;
   subscription_plan: string;
   account_status: GarageStatus;
   created_at: string;
@@ -141,7 +146,18 @@ function mapDbGarageToTenant(row: DbGarageRow): GarageTenant {
       wabaId: row.whatsapp_waba_id ?? '',
       businessDisplayName: row.whatsapp_display_name || row.garage_name,
       defaultMessage: row.whatsapp_default_message ?? '',
-      connectionStatus: 'not_connected',
+      connectionStatus:
+        row.whatsapp_connection_status === 'connected' &&
+        Boolean(row.whatsapp_phone_number_id?.trim()) &&
+        Boolean(row.whatsapp_waba_id?.trim())
+          ? 'connected'
+          : row.whatsapp_connection_status === 'pending_setup'
+            ? 'pending_setup'
+            : 'not_connected',
+      verifiedAt: row.whatsapp_verified_at ?? null,
+      verifiedPhoneNumber: row.whatsapp_verified_phone_number ?? null,
+      verifiedName: row.whatsapp_verified_name ?? null,
+      lastTestError: row.whatsapp_last_test_error ?? null,
     },
     reviewSocialLinks: {
       googleReviewUrl: row.google_review_url ?? '',
@@ -541,9 +557,7 @@ export async function fetchSupabaseGarageScopedData(garageId: string): Promise<{
       .order('created_at', { ascending: false }),
     client
       .from('whatsapp_logs')
-      .select(
-        'id, garage_id, job_card_id, recipient_number, message_type, message_status, whatsapp_message_id, sent_at, error_message, job_cards(customer_name, vehicle_number)',
-      )
+      .select('*, job_cards(job_card_number, customer_name, vehicle_number)')
       .eq('garage_id', garageId)
       .order('sent_at', { ascending: false, nullsFirst: false }),
     client
@@ -605,36 +619,23 @@ export async function fetchSupabaseGarageScopedData(garageId: string): Promise<{
     failedCount: r.failed_records,
   }));
 
-  const templates: MessageTemplate[] = (tplRes.data ?? []).map((r) => ({
-    id: r.id,
-    tenantId: r.garage_id,
-    name: r.template_name,
-    category: r.template_category as TemplateCategory,
-    body: r.template_content,
-    metaTemplateName: r.meta_template_name ?? '',
-    approvalStatus: r.approval_status,
-    updatedAt: r.created_at,
-  }));
+  const templates: MessageTemplate[] = (tplRes.data ?? []).map((r) => {
+    const ext = r as Record<string, unknown>;
+    return {
+      id: r.id,
+      tenantId: r.garage_id,
+      name: r.template_name,
+      category: (r.template_category as TemplateCategory) || 'delivery_notification',
+      body: r.template_content,
+      metaTemplateName: r.meta_template_name ?? '',
+      metaLanguageCode: (ext.meta_language_code as string) || 'en',
+      approvalStatus: r.approval_status,
+      updatedAt: (ext.updated_at as string) || r.created_at,
+    };
+  });
 
   const whatsappLogs: WhatsAppMessageLog[] = (logsRes.data ?? []).map(
-    (r: Record<string, unknown>) => {
-      const joinedCard = r.job_cards as
-        | { customer_name?: string; vehicle_number?: string }
-        | null;
-      const dbStatus = (r.message_status as WhatsAppMessageLog['status']) || 'draft_not_sent';
-      return {
-        id: r.id as string,
-        tenantId: r.garage_id as string,
-        jobCardId: (r.job_card_id as string) ?? '',
-        customerName: joinedCard?.customer_name || (r.recipient_number as string),
-        phoneNumber: r.recipient_number as string,
-        vehicleRegistration: joinedCard?.vehicle_number || '',
-        templateName: r.message_type as string,
-        renderedMessage: (r.error_message as string) ?? '',
-        status: dbStatus,
-        createdAt: (r.sent_at as string) ?? new Date().toISOString(),
-      };
-    },
+    (r: Record<string, unknown>) => mapDbWhatsAppLogRow(r),
   );
 
   const activeMembers: TenantUser[] = (membersRes.data ?? []).map((r: Record<string, unknown>) => {
@@ -730,14 +731,35 @@ export async function insertSupabaseWhatsAppLogDrafts(
   const rows = logs.map((log) => ({
     garage_id: garageId,
     job_card_id: uuidRegex.test(log.jobCardId) ? log.jobCardId : null,
+    template_id: log.templateId && uuidRegex.test(log.templateId) ? log.templateId : null,
+    meta_template_name: log.metaTemplateName || null,
     recipient_number: log.phoneNumber,
     message_type: log.templateName,
+    rendered_message: log.renderedMessage,
     message_status: 'draft_not_sent',
     sent_at: log.createdAt,
-    error_message: log.renderedMessage,
+    error_message: null,
   }));
 
-  const { error } = await client.from('whatsapp_logs').insert(rows);
+  let { error } = await client.from('whatsapp_logs').insert(rows);
+  if (
+    error &&
+    (error.message.includes('rendered_message') ||
+      error.message.includes('template_id') ||
+      error.message.includes('meta_template_name'))
+  ) {
+    const legacyRows = logs.map((log) => ({
+      garage_id: garageId,
+      job_card_id: uuidRegex.test(log.jobCardId) ? log.jobCardId : null,
+      recipient_number: log.phoneNumber,
+      message_type: log.templateName,
+      message_status: 'draft_not_sent',
+      sent_at: log.createdAt,
+      error_message: log.renderedMessage,
+    }));
+    const fallbackRes = await client.from('whatsapp_logs').insert(legacyRows);
+    error = fallbackRes.error;
+  }
   if (error) throw error;
 }
 
@@ -862,6 +884,11 @@ export async function updateSupabaseGarageFields(
     whatsapp_waba_id: string;
     whatsapp_display_name: string;
     whatsapp_default_message: string;
+    whatsapp_connection_status: 'not_connected' | 'pending_setup' | 'connected';
+    whatsapp_verified_at: string | null;
+    whatsapp_verified_phone_number: string | null;
+    whatsapp_verified_name: string | null;
+    whatsapp_last_test_error: string | null;
     account_status: GarageStatus;
   }>,
 ) {
@@ -880,7 +907,12 @@ export async function updateSupabaseGarageFields(
       error.message.includes('customer_welcome_text') ||
       error.message.includes('whatsapp_waba_id') ||
       error.message.includes('whatsapp_display_name') ||
-      error.message.includes('whatsapp_default_message'))
+      error.message.includes('whatsapp_default_message') ||
+      error.message.includes('whatsapp_connection_status') ||
+      error.message.includes('whatsapp_verified_at') ||
+      error.message.includes('whatsapp_verified_phone_number') ||
+      error.message.includes('whatsapp_verified_name') ||
+      error.message.includes('whatsapp_last_test_error'))
   ) {
     const coreUpdates: Record<string, unknown> = {};
     if (updates.garage_name !== undefined) coreUpdates.garage_name = updates.garage_name;
@@ -948,4 +980,272 @@ export async function fetchPublicGarageConnectionBySlug(
   }
 
   return readLocalPublicGarageCache(targetSlug);
+}
+
+function mapDbWhatsAppLogRow(r: Record<string, unknown>): WhatsAppMessageLog {
+  const joinedCard = r.job_cards as
+    | { job_card_number?: string; customer_name?: string; vehicle_number?: string }
+    | null;
+  const dbStatus = (r.message_status as WhatsAppMessageLog['status']) || 'draft_not_sent';
+  const renderedCol = typeof r.rendered_message === 'string' ? r.rendered_message : '';
+  const legacyErrOrDraft = typeof r.error_message === 'string' ? r.error_message : '';
+
+  return {
+    id: String(r.id ?? ''),
+    tenantId: String(r.garage_id ?? ''),
+    jobCardId: String(r.job_card_id ?? ''),
+    jobCardNumber: joinedCard?.job_card_number || '',
+    customerName: joinedCard?.customer_name || String(r.recipient_number ?? ''),
+    phoneNumber: String(r.recipient_number ?? ''),
+    vehicleRegistration: joinedCard?.vehicle_number || '',
+    templateId: (r.template_id as string | null | undefined) ?? null,
+    templateName: String(r.message_type ?? ''),
+    metaTemplateName: (r.meta_template_name as string | null | undefined) ?? null,
+    renderedMessage: renderedCol || (dbStatus === 'draft_not_sent' ? legacyErrOrDraft : ''),
+    whatsappMessageId: (r.whatsapp_message_id as string | null | undefined) ?? null,
+    errorMessage: dbStatus === 'failed' ? legacyErrOrDraft : null,
+    deliveredAt: (r.delivered_at as string | null | undefined) ?? null,
+    readAt: (r.read_at as string | null | undefined) ?? null,
+    failedAt: (r.failed_at as string | null | undefined) ?? null,
+    statusUpdatedAt: (r.status_updated_at as string | null | undefined) ?? null,
+    status: dbStatus,
+    createdAt: (r.sent_at as string) ?? new Date().toISOString(),
+  };
+}
+
+export async function fetchSupabaseWhatsAppLogs(
+  garageId: string,
+): Promise<WhatsAppMessageLog[]> {
+  const client = getSupabaseClient();
+  if (!client || !garageId) return [];
+
+  const { data, error } = await client
+    .from('whatsapp_logs')
+    .select('*, job_cards(job_card_number, customer_name, vehicle_number)')
+    .eq('garage_id', garageId)
+    .order('sent_at', { ascending: false, nullsFirst: false });
+
+  if (error) throw new Error(error.message);
+  return (data ?? []).map((r) => mapDbWhatsAppLogRow(r as Record<string, unknown>));
+}
+
+export async function saveSupabaseWhatsAppTemplate(
+  garageId: string,
+  template: MessageTemplate,
+): Promise<MessageTemplate> {
+  const client = getSupabaseClient();
+  if (!client) return template;
+
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const payload = {
+    garage_id: garageId,
+    template_name: template.name.trim(),
+    template_category: template.category,
+    template_content: template.body,
+    meta_template_name: template.metaTemplateName.trim(),
+    meta_language_code: (template.metaLanguageCode || 'en').trim() || 'en',
+    approval_status: template.approvalStatus,
+    updated_at: new Date().toISOString(),
+  };
+
+  if (uuidRegex.test(template.id)) {
+    let { data, error } = await client
+      .from('whatsapp_templates')
+      .update(payload)
+      .eq('id', template.id)
+      .eq('garage_id', garageId)
+      .select('*')
+      .single();
+
+    if (
+      error &&
+      (error.message.includes('meta_language_code') || error.message.includes('updated_at'))
+    ) {
+      const fallbackUpdate = await client
+        .from('whatsapp_templates')
+        .update({
+          template_name: payload.template_name,
+          template_category: payload.template_category,
+          template_content: payload.template_content,
+          meta_template_name: payload.meta_template_name,
+          approval_status: payload.approval_status,
+        })
+        .eq('id', template.id)
+        .eq('garage_id', garageId)
+        .select('*')
+        .single();
+      data = fallbackUpdate.data;
+      error = fallbackUpdate.error;
+    }
+    if (error) throw error;
+    const ext = data as Record<string, unknown>;
+    return {
+      ...template,
+      id: data.id,
+      metaLanguageCode: (ext.meta_language_code as string) || payload.meta_language_code,
+      updatedAt: (ext.updated_at as string) || data.created_at,
+    };
+  }
+
+  let { data, error } = await client
+    .from('whatsapp_templates')
+    .insert(payload)
+    .select('*')
+    .single();
+
+  if (
+    error &&
+    (error.message.includes('meta_language_code') || error.message.includes('updated_at'))
+  ) {
+    const fallbackInsert = await client
+      .from('whatsapp_templates')
+      .insert({
+        garage_id: garageId,
+        template_name: payload.template_name,
+        template_category: payload.template_category,
+        template_content: payload.template_content,
+        meta_template_name: payload.meta_template_name,
+        approval_status: payload.approval_status,
+      })
+      .select('*')
+      .single();
+    data = fallbackInsert.data;
+    error = fallbackInsert.error;
+  }
+  if (error) throw error;
+  const ext = data as Record<string, unknown>;
+  return {
+    ...template,
+    id: data.id,
+    metaLanguageCode: (ext.meta_language_code as string) || payload.meta_language_code,
+    updatedAt: (ext.updated_at as string) || data.created_at,
+  };
+}
+
+export async function deleteSupabaseWhatsAppTemplate(
+  garageId: string,
+  templateId: string,
+): Promise<void> {
+  const client = getSupabaseClient();
+  if (!client) return;
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(templateId)) return;
+
+  const { error } = await client
+    .from('whatsapp_templates')
+    .delete()
+    .eq('id', templateId)
+    .eq('garage_id', garageId);
+  if (error) throw error;
+}
+
+async function invokeWhatsAppDispatchEdge<T>(
+  body: Record<string, unknown>,
+): Promise<T> {
+  const client = getSupabaseClient();
+  if (!client) {
+    throw new Error('Supabase is not configured. Connect your Supabase project first.');
+  }
+
+  const { data, error } = await client.functions.invoke('whatsapp-dispatch', {
+    body,
+  });
+
+  if (error) {
+    // Extract real server error payload from FunctionsHttpError when available
+    const maybeContext = (error as { context?: Response }).context;
+    if (maybeContext && typeof maybeContext.json === 'function') {
+      try {
+        const errPayload = (await maybeContext.json()) as { error?: string };
+        if (errPayload?.error) {
+          throw new Error(errPayload.error);
+        }
+      } catch (inner) {
+        if (inner instanceof Error && inner.message !== error.message) {
+          throw inner;
+        }
+      }
+    }
+    const msg = error.message || 'Unable to reach Supabase Edge Function whatsapp-dispatch.';
+    if (
+      msg.toLowerCase().includes('failed to send a request') ||
+      msg.toLowerCase().includes('networkerror') ||
+      msg.toLowerCase().includes('not found')
+    ) {
+      throw new Error(
+        'Supabase Edge Function "whatsapp-dispatch" is not deployed or unreachable yet. Deploy it with supabase functions deploy whatsapp-dispatch.',
+      );
+    }
+    throw new Error(msg);
+  }
+
+  const typed = data as { error?: string } | null;
+  if (typed && typeof typed === 'object' && typed.error) {
+    throw new Error(typed.error);
+  }
+
+  return data as T;
+}
+
+export interface WhatsAppConnectionTestResponse {
+  connected: boolean;
+  verifiedAt?: string;
+  verifiedPhoneNumber?: string;
+  verifiedName?: string;
+  qualityRating?: string;
+  error?: string;
+}
+
+export async function testWhatsAppConnectionSupabaseEdge(
+  garageId: string,
+): Promise<WhatsAppConnectionTestResponse> {
+  return invokeWhatsAppDispatchEdge<WhatsAppConnectionTestResponse>({
+    action: 'test_connection',
+    garageId,
+  });
+}
+
+export interface SyncedMetaTemplateItem {
+  metaTemplateName: string;
+  approvalStatus: 'draft' | 'pending' | 'approved' | 'rejected';
+  languageCode: string;
+  category: string;
+  body: string;
+}
+
+export async function syncMetaTemplatesSupabaseEdge(
+  garageId: string,
+): Promise<{ templates: SyncedMetaTemplateItem[] }> {
+  return invokeWhatsAppDispatchEdge<{ templates: SyncedMetaTemplateItem[] }>({
+    action: 'sync_templates',
+    garageId,
+  });
+}
+
+export interface LiveWhatsAppDispatchResultItem {
+  jobCardId: string;
+  logId?: string;
+  status: 'sent' | 'failed' | 'skipped';
+  whatsappMessageId?: string | null;
+  error?: string;
+}
+
+export interface LiveWhatsAppBatchResponse {
+  sentCount: number;
+  failedCount: number;
+  skippedCount: number;
+  results: LiveWhatsAppDispatchResultItem[];
+}
+
+export async function sendLiveWhatsAppBatchSupabaseEdge(params: {
+  garageId: string;
+  templateId: string;
+  jobCardIds: string[];
+}): Promise<LiveWhatsAppBatchResponse> {
+  return invokeWhatsAppDispatchEdge<LiveWhatsAppBatchResponse>({
+    action: 'send_batch',
+    garageId: params.garageId,
+    templateId: params.templateId,
+    jobCardIds: params.jobCardIds,
+  });
 }

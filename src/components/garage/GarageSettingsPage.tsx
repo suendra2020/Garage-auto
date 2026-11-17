@@ -28,6 +28,7 @@ import {
   canManageGarageStaff,
   validateStaffCreationInput,
 } from '../../utils/tenantLogic';
+import { validateWhatsAppCredentialsInput } from '../../utils/whatsappCloud';
 import { CustomerConnectionCard } from '../public/CustomerConnectionCard';
 
 async function fileToResizedDataUrl(file: File): Promise<string> {
@@ -78,6 +79,7 @@ export function GarageSettingsPage() {
     updateActiveBranding,
     updateActiveReviewLinks,
     updateActiveWhatsAppSettings,
+    testActiveWhatsAppConnection,
     createGarageStaffAccount,
   } = useAppState();
 
@@ -127,6 +129,12 @@ export function GarageSettingsPage() {
   const [waSaving, setWaSaving] = useState(false);
   const [waSaveError, setWaSaveError] = useState('');
   const [waSaved, setWaSaved] = useState(false);
+  const [waFieldErrors, setWaFieldErrors] = useState<Record<string, string>>({});
+  const [waTesting, setWaTesting] = useState(false);
+  const [waTestFeedback, setWaTestFeedback] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
 
   // Staff Account fields
   const [staffName, setStaffName] = useState('');
@@ -306,14 +314,25 @@ export function GarageSettingsPage() {
     if (!canManage) return;
     setWaSaveError('');
     setWaSaved(false);
+    setWaTestFeedback(null);
+
+    if (phoneNumberId.trim() || wabaId.trim()) {
+      const check = validateWhatsAppCredentialsInput({ phoneNumberId, wabaId });
+      if (!check.valid) {
+        setWaFieldErrors(check.errors);
+        return;
+      }
+    }
+    setWaFieldErrors({});
+
     setWaSaving(true);
     try {
       await updateActiveWhatsAppSettings({
+        ...activeTenant.whatsappSettings,
         phoneNumberId: phoneNumberId.trim(),
         wabaId: wabaId.trim(),
         businessDisplayName: businessDisplayName.trim() || displayName.trim(),
         defaultMessage: defaultMessage.trim(),
-        connectionStatus: 'not_connected',
       });
       setWaSaved(true);
       setTimeout(() => setWaSaved(false), 3000);
@@ -323,6 +342,69 @@ export function GarageSettingsPage() {
       );
     } finally {
       setWaSaving(false);
+    }
+  };
+
+  const handleTestWhatsAppConnection = async () => {
+    if (!canManage) return;
+    setWaSaveError('');
+    setWaTestFeedback(null);
+
+    const check = validateWhatsAppCredentialsInput({ phoneNumberId, wabaId });
+    if (!check.valid) {
+      setWaFieldErrors(check.errors);
+      setWaTestFeedback({
+        ok: false,
+        message: 'Enter valid numeric Phone Number ID and WABA Account ID before testing.',
+      });
+      return;
+    }
+    setWaFieldErrors({});
+    setWaTesting(true);
+
+    try {
+      // Persist edited IDs first so the Edge Function tests the latest garage credentials
+      const idsChanged =
+        phoneNumberId.trim() !== activeTenant.whatsappSettings.phoneNumberId.trim() ||
+        wabaId.trim() !== activeTenant.whatsappSettings.wabaId.trim() ||
+        businessDisplayName.trim() !== activeTenant.whatsappSettings.businessDisplayName.trim() ||
+        defaultMessage.trim() !== (activeTenant.whatsappSettings.defaultMessage ?? '').trim();
+
+      if (idsChanged) {
+        await updateActiveWhatsAppSettings({
+          ...activeTenant.whatsappSettings,
+          phoneNumberId: phoneNumberId.trim(),
+          wabaId: wabaId.trim(),
+          businessDisplayName: businessDisplayName.trim() || displayName.trim(),
+          defaultMessage: defaultMessage.trim(),
+        });
+      }
+
+      const res = await testActiveWhatsAppConnection();
+      if (res.connected) {
+        const detail = [
+          res.verifiedName ? `Verified Name: ${res.verifiedName}` : '',
+          res.verifiedPhoneNumber ? `Phone: ${res.verifiedPhoneNumber}` : '',
+        ]
+          .filter(Boolean)
+          .join(' · ');
+        setWaTestFeedback({
+          ok: true,
+          message: `WhatsApp Cloud API connected${detail ? ` (${detail})` : ''}.`,
+        });
+      } else {
+        setWaTestFeedback({
+          ok: false,
+          message: res.error || 'Meta Graph API connection test failed.',
+        });
+      }
+    } catch (err) {
+      setWaTestFeedback({
+        ok: false,
+        message: err instanceof Error ? err.message : 'WhatsApp Cloud API connection test failed.',
+      });
+    } finally {
+      setWaTesting(false);
     }
   };
 
@@ -743,16 +825,26 @@ export function GarageSettingsPage() {
               WhatsApp Message Settings
             </h2>
             <p className="mt-1 text-sm text-slate-600">
-              Store this garage&apos;s Meta WhatsApp Cloud API identifiers and default delivery greeting separately from all other garages.
+              Configure this garage&apos;s Meta Phone Number ID and WABA ID. The permanent WhatsApp Access Token is stored strictly as a server-side Supabase Edge Function secret.
             </p>
           </div>
-          <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-700 whitespace-nowrap">
-            <AlertCircle className="h-4 w-4" aria-hidden="true" />
-            Integration Not Connected
-          </span>
+          {activeTenant.whatsappSettings.connectionStatus === 'connected' ? (
+            <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700 whitespace-nowrap">
+              <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
+              Connected
+              {activeTenant.whatsappSettings.verifiedPhoneNumber
+                ? ` · ${activeTenant.whatsappSettings.verifiedPhoneNumber}`
+                : ''}
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-700 whitespace-nowrap">
+              <AlertCircle className="h-4 w-4" aria-hidden="true" />
+              Not Connected
+            </span>
+          )}
         </div>
 
-        <form onSubmit={(e) => void handleSaveWhatsApp(e)} className="mt-5 grid gap-4 sm:grid-cols-3">
+        <form onSubmit={(e) => void handleSaveWhatsApp(e)} noValidate className="mt-5 grid gap-4 sm:grid-cols-3">
           <div>
             <label htmlFor="wa-phone-id" className="block text-sm font-medium text-slate-700">
               Phone Number ID
@@ -766,6 +858,9 @@ export function GarageSettingsPage() {
               placeholder="e.g. 109482716354"
               className="mt-1 min-h-[44px] w-full rounded-xl border border-slate-300 px-3.5 font-mono text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
             />
+            {waFieldErrors.phoneNumberId && (
+              <p className="mt-1 text-xs text-red-600">{waFieldErrors.phoneNumberId}</p>
+            )}
           </div>
           <div>
             <label htmlFor="wa-waba-id" className="block text-sm font-medium text-slate-700">
@@ -780,6 +875,9 @@ export function GarageSettingsPage() {
               placeholder="e.g. 204958172635"
               className="mt-1 min-h-[44px] w-full rounded-xl border border-slate-300 px-3.5 font-mono text-sm text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
             />
+            {waFieldErrors.wabaId && (
+              <p className="mt-1 text-xs text-red-600">{waFieldErrors.wabaId}</p>
+            )}
           </div>
           <div>
             <label htmlFor="wa-biz-name" className="block text-sm font-medium text-slate-700">
@@ -816,23 +914,54 @@ export function GarageSettingsPage() {
             </p>
           )}
 
+          {waTestFeedback && (
+            <div
+              role="status"
+              className={`rounded-xl border p-3 text-xs font-medium sm:col-span-3 ${
+                waTestFeedback.ok
+                  ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
+                  : 'border-red-200 bg-red-50 text-red-800'
+              }`}
+            >
+              {waTestFeedback.message}
+            </div>
+          )}
+
+          {!waTestFeedback &&
+            activeTenant.whatsappSettings.connectionStatus !== 'connected' &&
+            activeTenant.whatsappSettings.lastTestError && (
+              <p className="text-xs text-red-600 sm:col-span-3">
+                Last API test error: {activeTenant.whatsappSettings.lastTestError}
+              </p>
+            )}
+
           {canManage && (
             <div className="flex flex-wrap items-center justify-between gap-3 pt-2 sm:col-span-3">
               <div>
                 {waSaved && (
                   <span className="inline-flex items-center gap-1.5 text-sm font-medium text-emerald-700">
                     <CheckCircle2 className="h-4 w-4" aria-hidden="true" />
-                    WhatsApp settings saved (live dispatch requires Edge Function)
+                    WhatsApp settings saved. Run Test Connection to verify live API access.
                   </span>
                 )}
               </div>
-              <button
-                type="submit"
-                disabled={waSaving}
-                className="min-h-[44px] rounded-xl bg-navy-900 px-5 py-2 text-sm font-medium text-white hover:bg-navy-800 disabled:opacity-60 whitespace-nowrap"
-              >
-                {waSaving ? 'Saving...' : 'Save WhatsApp Settings'}
-              </button>
+              <div className="flex flex-wrap items-center gap-2.5">
+                <button
+                  type="button"
+                  disabled={waTesting || waSaving}
+                  onClick={() => void handleTestWhatsAppConnection()}
+                  className="min-h-[44px] rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-800 hover:bg-slate-50 disabled:opacity-60 whitespace-nowrap"
+                >
+                  {waTesting ? 'Testing Connection...' : 'Test WhatsApp Connection'}
+                </button>
+                <button
+                  type="submit"
+                  disabled={waSaving || waTesting}
+                  className="min-h-[44px] rounded-xl bg-navy-900 px-5 py-2 text-sm font-medium text-white hover:bg-navy-800 disabled:opacity-60 whitespace-nowrap"
+                >
+                  {waSaving ? 'Saving...' : 'Save WhatsApp Settings'}
+                </button>
+              </div>
             </div>
           )}
         </form>
